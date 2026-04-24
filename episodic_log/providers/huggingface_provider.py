@@ -72,6 +72,14 @@ class HuggingFaceProvider(BaseProvider):
             model_name, **kwargs
         )
         self._model.eval()
+        # Reset model's default sampling params to their neutral values so that
+        # greedy decoding (do_sample=False) does not trigger a transformers
+        # UserWarning about ignored temperature/top_p/top_k defaults.
+        if hasattr(self._model, "generation_config"):
+            self._model.generation_config.temperature = 1.0
+            self._model.generation_config.top_p = 1.0
+            self._model.generation_config.top_k = 0
+            self._model.generation_config.do_sample = False
         logger.info("HuggingFaceProvider: model loaded.")
 
     @property
@@ -125,6 +133,10 @@ class HuggingFaceProvider(BaseProvider):
         )
         device = next(self._model.parameters()).device
         input_ids = inputs["input_ids"].to(device)
+        # Pass attention_mask explicitly to suppress the pad==eos UserWarning.
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
         do_sample = temperature > 0.0
         gen_kwargs: dict[str, Any] = {
@@ -132,6 +144,8 @@ class HuggingFaceProvider(BaseProvider):
             "do_sample": do_sample,
             "pad_token_id": self._tokenizer.eos_token_id,
         }
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
         if do_sample:
             gen_kwargs["temperature"] = temperature
 
@@ -143,6 +157,8 @@ class HuggingFaceProvider(BaseProvider):
 
         # Explicitly free GPU memory for the intermediate tensors.
         del input_ids, output_ids, new_ids
+        if attention_mask is not None:
+            del attention_mask
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

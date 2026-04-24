@@ -275,11 +275,35 @@ def _run_sessions(
             summary_file.unlink()
 
         store = SummaryStore(summaries_dir)
+        failed_events = 0
         for event in events:
-            summary = summarizer.summarize(event)
-            store.write(summary)
+            try:
+                summary = summarizer.summarize(event)
+                store.write(summary)
+            except Exception as exc:
+                worker_logger.error(
+                    "Summarize error: session=%s turn=%s method=%s: %s",
+                    session_meta["session_id"], event.turn_id, method, exc,
+                    exc_info=True,
+                )
+                failed_events += 1
 
-        bar.set_postfix({"session": session_meta["session_id"][:16]})
+        if failed_events == len(events) and events:
+            # All events failed — remove the (now empty) file so a re-run
+            # won't skip this session as "already done".
+            if summary_file.exists():
+                summary_file.unlink()
+            worker_logger.error(
+                "ALL %d events failed for session %s — deleted empty %s.jsonl",
+                len(events), session_meta["session_id"], method,
+            )
+        elif failed_events:
+            worker_logger.warning(
+                "Session %s: %d/%d events failed summarization.",
+                session_meta["session_id"], failed_events, len(events),
+            )
+
+        bar.set_postfix({"session": session_meta["session_id"][:16], "failed_ev": failed_events})
 
     worker_logger.info("%s: finished %d sessions", tag, len(sessions))
 

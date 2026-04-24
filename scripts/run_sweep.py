@@ -198,6 +198,9 @@ def sweep(
         typer.echo("ERROR: No models selected after filtering.", err=True)
         raise typer.Exit(1)
 
+    # ── Pre-flight: verify summary files exist for retrieval conditions ──
+    _preflight_check_summaries(sessions_meta, condition_list, method_list)
+
     # ── Detect GPU count ─────────────────────────────────────────────────
     if num_gpus is None:
         try:
@@ -229,6 +232,55 @@ def sweep(
     )
 
     typer.echo("\nSweep complete. Run judge.py then score.py.")
+
+
+# Conditions that require per-session summary JSONL files for BM25 retrieval.
+_CONDITIONS_NEEDING_SUMMARIES: frozenset[str] = frozenset(
+    {"episodic", "adversarial", "proactive", "external"}
+)
+
+
+def _preflight_check_summaries(
+    sessions_meta: list[dict],
+    condition_list: list[str],
+    method_list: list[str],
+) -> None:
+    """Abort with a clear error if any required summary files are missing.
+
+    Only checks methods for conditions that actually use BM25 retrieval.
+    Prints a per-method summary and exits non-zero if any are absent.
+
+    Args:
+        sessions_meta: Pre-loaded session index records.
+        condition_list: Conditions requested for this sweep run.
+        method_list: Summarizer methods requested for this sweep run.
+    """
+    needs_summaries = any(c in _CONDITIONS_NEEDING_SUMMARIES for c in condition_list)
+    if not needs_summaries:
+        return
+
+    any_missing = False
+    for method in method_list:
+        missing = [
+            s for s in sessions_meta
+            if not (Path(s["summaries_dir"]) / f"{method}.jsonl").exists()
+        ]
+        if missing:
+            any_missing = True
+            typer.echo(
+                f"PRE-FLIGHT ERROR: {len(missing)}/{len(sessions_meta)} sessions "
+                f"are missing '{method}.jsonl' summary files.\n"
+                f"  First missing session: {missing[0]['session_id']}\n"
+                f"  Expected path: {Path(missing[0]['summaries_dir']) / f'{method}.jsonl'}\n"
+                f"  Fix: python scripts/summarize.py --method {method} "
+                f"{'--provider hf:<model>' if method != 'structured' else ''}",
+                err=True,
+            )
+        else:
+            typer.echo(f"Pre-flight OK: all {len(sessions_meta)} sessions have '{method}.jsonl'.")
+
+    if any_missing:
+        raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
