@@ -5,13 +5,13 @@ Usage
 # Summarize all sessions with the structured (no-model) method
 python scripts/summarize.py --method structured
 
-# Summarize with haiku (Groq Llama-3.1-8b) method
-python scripts/summarize.py --method haiku --provider groq:llama-3.1-8b-instant
+# Summarize with haiku (any small HF model) method
+python scripts/summarize.py --method haiku --provider hf:Qwen/Qwen2.5-7B-Instruct
 
 # Summarize all three methods sequentially
 python scripts/summarize.py --method structured
-python scripts/summarize.py --method haiku
-python scripts/summarize.py --method self --provider groq:llama-3.1-8b-instant
+python scripts/summarize.py --method haiku --provider hf:Qwen/Qwen2.5-7B-Instruct
+python scripts/summarize.py --method self --provider hf:Qwen/Qwen2.5-7B-Instruct
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def summarize(
     ] = Path("data/sessions_index.jsonl"),
     provider_spec: Annotated[
         str | None,
-        typer.Option("--provider", help="Provider spec (e.g. groq:llama-3.1-8b-instant). Required for haiku/self."),
+        typer.Option("--provider", help="Provider spec (e.g. hf:Qwen/Qwen2.5-7B-Instruct). Required for haiku/self."),
     ] = None,
     overwrite: Annotated[
         bool,

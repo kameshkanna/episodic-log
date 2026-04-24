@@ -65,7 +65,7 @@ The agent **cannot write to its own log** — the episodic log is append-only an
 | Method | Description |
 |---|---|
 | `structured` | Rule-based extraction — no model required, deterministic |
-| `haiku` | LLM summary via Groq small model |
+| `haiku` | LLM summary via any small HF model (e.g. Qwen2.5-7B) |
 | `self` | Agent writes its own summaries during ingestion |
 
 ---
@@ -144,8 +144,8 @@ python scripts/ingest.py
 
 # Step 2: Build all summary methods
 python scripts/summarize.py --method structured
-python scripts/summarize.py --method haiku
-python scripts/summarize.py --method self
+python scripts/summarize.py --method haiku --provider hf:Qwen/Qwen2.5-7B-Instruct
+python scripts/summarize.py --method self  --provider hf:Qwen/Qwen2.5-7B-Instruct
 
 # Step 3: Multi-model sweep — loads/unloads each model automatically
 # All 9 models × all 7 conditions × structured summaries
