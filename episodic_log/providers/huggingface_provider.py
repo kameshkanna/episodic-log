@@ -164,8 +164,25 @@ class HuggingFaceProvider(BaseProvider):
             gen_kwargs["temperature"] = temperature
 
         input_len = input_ids.shape[-1]
-        with torch.inference_mode():
-            output_ids = self._model.generate(input_ids, **gen_kwargs)
+        try:
+            with torch.inference_mode():
+                output_ids = self._model.generate(input_ids, **gen_kwargs)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "generate_batch: OOM on batch_size=%d input_len=%d — falling back to sequential",
+                len(prompts), input_len,
+            )
+            del input_ids
+            if attention_mask is not None:
+                del attention_mask
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            return [
+                self.generate(msgs, system=system, max_tokens=max_tokens,
+                               temperature=temperature)
+                for msgs in batch_messages
+            ]
 
         results: list[str] = []
         for i in range(len(prompts)):

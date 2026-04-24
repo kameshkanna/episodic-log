@@ -42,6 +42,7 @@ _USER_PROMPT_TEMPLATE = (
 
 _MAX_TOKENS = 128
 _TEMPERATURE = 0.0
+_MAX_CONTENT_CHARS = 1500
 
 
 class SelfSummarizer(AbstractSummarizer):
@@ -126,7 +127,7 @@ class SelfSummarizer(AbstractSummarizer):
     def summarize_batch(
         self,
         events: list[TurnEvent],
-        batch_size: int = 32,
+        batch_size: int = 8,
     ) -> list[TurnSummary]:
         """Summarize *events* in batches using a single model.generate() per batch.
 
@@ -176,6 +177,9 @@ def _format_prompt(event: TurnEvent) -> str:
     Returns:
         A fully-formatted prompt string ready for model inference.
     """
+    content = event.content
+    if len(content) > _MAX_CONTENT_CHARS:
+        content = content[:_MAX_CONTENT_CHARS] + " …[truncated]"
     return _USER_PROMPT_TEMPLATE.format(
         turn_id=event.turn_id,
         session_id=event.session_id,
@@ -183,5 +187,5 @@ def _format_prompt(event: TurnEvent) -> str:
         type=event.type.value,
         tool_name=event.tool_name if event.tool_name is not None else "none",
         file_path=event.file_path if event.file_path is not None else "none",
-        content=event.content,
+        content=content,
     )
