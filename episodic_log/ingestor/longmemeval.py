@@ -27,7 +27,7 @@ _TURN_ID_WIDTH = 4
 
 # HuggingFace dataset coordinates.
 _HF_DATASET_NAME = "xiaowu0162/longmemeval-cleaned"
-_HF_DATASET_SPLIT = "test"
+_HF_ORACLE_FILE = "longmemeval_oracle.json"
 
 
 @dataclass
@@ -199,46 +199,60 @@ class LongMemEvalIngestor:
 
     @staticmethod
     def load_dataset(n: int | None = None, seed: int = 42) -> list[dict[str, Any]]:
-        """Load LongMemEval from HuggingFace ``datasets``.
+        """Load LongMemEval from HuggingFace by downloading the oracle JSON directly.
 
-        Dataset: ``xiaowu0162/longmemeval-cleaned``, split: ``test``.
-        The dataset is shuffled with *seed* for reproducibility; when *n* is
-        provided only the first *n* instances after shuffling are returned.
+        Downloads ``longmemeval_oracle.json`` (15 MB, 500 examples) from
+        ``xiaowu0162/longmemeval-cleaned`` via ``huggingface_hub``.  The
+        ``datasets`` library is intentionally bypassed because the repo also
+        contains a 2.7 GB multi-session file that overflows PyArrow's int32
+        block-size when the library tries to process all files at once.
+
+        The returned list is shuffled with *seed* for reproducibility; when *n*
+        is provided only the first *n* instances after shuffling are returned.
 
         Args:
             n: Optional upper bound on the number of instances to return.
-            seed: Random seed passed to ``Dataset.shuffle``.
+            seed: Random seed used to shuffle the full instance list.
 
         Returns:
             A plain Python list of instance dicts, each matching the
             LongMemEval schema documented in this module.
 
         Raises:
-            ImportError: If the ``datasets`` package is not installed.
+            ImportError: If ``huggingface_hub`` is not installed.
             ValueError: If *n* is provided but is not a positive integer.
         """
+        import json
+        import random
+
         if n is not None and (not isinstance(n, int) or n <= 0):
             raise ValueError(f"n must be a positive integer or None, got {n!r}")
 
         try:
-            from datasets import load_dataset  # type: ignore[import]
+            from huggingface_hub import hf_hub_download  # type: ignore[import]
         except ImportError as exc:
             raise ImportError(
-                "The 'datasets' package is required to load LongMemEval. "
-                "Install it with: pip install datasets"
+                "huggingface_hub is required. Install it with: pip install huggingface-hub"
             ) from exc
 
         logger.info(
-            "Loading %s (split=%s) from HuggingFace…",
+            "Downloading %s / %s from HuggingFace…",
             _HF_DATASET_NAME,
-            _HF_DATASET_SPLIT,
+            _HF_ORACLE_FILE,
         )
-        ds = load_dataset(_HF_DATASET_NAME, split=_HF_DATASET_SPLIT)
-        ds = ds.shuffle(seed=seed)
-        if n is not None:
-            ds = ds.select(range(n))
+        local_path = hf_hub_download(
+            repo_id=_HF_DATASET_NAME,
+            filename=_HF_ORACLE_FILE,
+            repo_type="dataset",
+        )
+        with open(local_path, "r", encoding="utf-8") as fh:
+            instances: list[dict[str, Any]] = json.load(fh)
 
-        instances: list[dict[str, Any]] = list(ds)
+        rng = random.Random(seed)
+        rng.shuffle(instances)
+        if n is not None:
+            instances = instances[:n]
+
         logger.info("Loaded %d LongMemEval instances.", len(instances))
         return instances
 
