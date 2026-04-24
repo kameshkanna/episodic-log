@@ -1,39 +1,39 @@
 """Multi-model sweep — runs all conditions across a configurable model matrix.
 
-Loads each model once, evaluates all requested conditions, then explicitly
-unloads it and clears GPU memory before loading the next model.  Results
-(predictions only, no verdicts) are written to:
+Loads each model once per GPU worker, evaluates all assigned conditions, then
+explicitly unloads it before loading the next model.  With --num-gpus > 1 the
+matrix is distributed across workers so multiple models run simultaneously.
+
+Results (predictions only, no verdicts) are written to:
     ``data/results/<model-slug>/<condition>__<method>.jsonl``
 
-Run judge.py separately after the sweep to fill in verdicts in parallel
-using batched Groq requests — much faster than inline per-row judging.
+Run judge.py separately after the sweep to fill in verdicts using local HF
+models across all GPUs — no API calls, no rate limits.
 
-Recommended workflow
---------------------
-# Step 1 — Inference sweep (GPU)
-python scripts/run_sweep.py --conditions baseline,episodic --size-filter small
+Recommended workflow (8x A100)
+--------------------------------
+# Step 1 — Inference sweep (all 8 GPUs in parallel)
+python scripts/run_sweep.py --summary-methods structured,haiku,self
 
-# Step 2 — Batch judge all results (Groq, parallel, fast)
-python scripts/judge.py --judge-provider groq:llama-3.1-70b-versatile
+# Step 2 — Local HF judge across all 8 GPUs
+python scripts/judge.py --judge-provider hf:Qwen/Qwen2.5-14B-Instruct
 
 # Step 3 — Score
-python scripts/score.py
+python scripts/score.py --breakdown
 
 Other examples
 --------------
 # Dry-run: see planned runs without executing
 python scripts/run_sweep.py --dry-run
 
-# Full sweep — all 9 models × all 7 conditions
-python scripts/run_sweep.py
+# Small models only, two conditions
+python scripts/run_sweep.py --size-filter small --conditions baseline,episodic
 
-# Only Qwen family
-python scripts/run_sweep.py --family-filter qwen --conditions baseline,episodic
+# Single model, explicit GPU
+python scripts/run_sweep.py --model hf:Qwen/Qwen2.5-7B-Instruct --num-gpus 1
 
-# Single model
-python scripts/run_sweep.py \
-    --model hf:Qwen/Qwen2.5-7B-Instruct \
-    --conditions baseline,episodic,proactive
+# Override GPU count
+python scripts/run_sweep.py --num-gpus 4
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import multiprocessing as mp
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,7 +63,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model matrix
+# Model matrix  (tuned for 8× A100 80 GB SXM4)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -70,23 +72,23 @@ class ModelSpec:
 
     spec: str
     slug: str
-    size: str  # "small" | "medium" | "large"
+    size: str   # "small" | "medium" | "large"
     family: str
 
 
 MODEL_MATRIX: list[ModelSpec] = [
-    # --- Small (7–9B, BF16) ---
-    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",          "llama-3.1-8b",    "small",  "llama"),
-    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",                  "qwen-2.5-7b",     "small",  "qwen"),
-    ModelSpec("hf:google/gemma-2-9b-it",                       "gemma-2-9b",      "small",  "gemma"),
-    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",         "mistral-7b",      "small",  "mistral"),
-    # --- Medium (14–27B) ---
-    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",                  "qwen-2.5-14b",    "medium", "qwen"),
-    ModelSpec("hf:google/gemma-2-27b-it:4bit",                 "gemma-2-27b-4bit","medium", "gemma"),
-    # --- Large (32–72B, 4-bit) ---
-    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct:4bit",            "qwen-2.5-32b-4bit","large", "qwen"),
-    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct:4bit",    "llama-3.3-70b-4bit","large","llama"),
-    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct:4bit",            "qwen-2.5-72b-4bit","large", "qwen"),
+    # --- Small (7–9B, BF16, ~14–18 GB) ---
+    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",        "llama-3.1-8b",      "small",  "llama"),
+    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",                "qwen-2.5-7b",       "small",  "qwen"),
+    ModelSpec("hf:google/gemma-2-9b-it",                     "gemma-2-9b",        "small",  "gemma"),
+    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",       "mistral-7b",        "small",  "mistral"),
+    # --- Medium (14–27B, BF16, ~28–54 GB — fit in 80 GB) ---
+    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",               "qwen-2.5-14b",      "medium", "qwen"),
+    ModelSpec("hf:google/gemma-2-27b-it",                    "gemma-2-27b",       "medium", "gemma"),
+    # --- Large (32–72B, 4-bit, ~16–36 GB) ---
+    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct:4bit",          "qwen-2.5-32b-4bit", "large",  "qwen"),
+    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct:4bit",  "llama-3.3-70b-4bit","large",  "llama"),
+    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct:4bit",          "qwen-2.5-72b-4bit", "large",  "qwen"),
 ]
 
 _SIZE_LABELS = {"small", "medium", "large"}
@@ -114,10 +116,7 @@ def sweep(
     ] = None,
     size_filter: Annotated[
         str | None,
-        typer.Option(
-            "--size-filter",
-            help="Only run models of this size: small | medium | large.",
-        ),
+        typer.Option("--size-filter", help="Only run models of this size: small | medium | large."),
     ] = None,
     family_filter: Annotated[
         str | None,
@@ -146,20 +145,13 @@ def sweep(
         Path,
         typer.Option(help="Root results directory."),
     ] = Path("data/results"),
-    judge: Annotated[
-        bool,
+    num_gpus: Annotated[
+        int | None,
         typer.Option(
-            "--judge/--no-judge",
-            help=(
-                "Inline CHD judging after each condition. "
-                "Prefer running scripts/judge.py separately for batched parallel judging."
-            ),
+            "--num-gpus",
+            help="Number of GPUs to use in parallel (default: all available).",
         ),
-    ] = False,
-    judge_provider_spec: Annotated[
-        str,
-        typer.Option("--judge-provider", help="Provider spec for inline CHD judge (only used with --judge)."),
-    ] = "groq:llama-3.1-70b-versatile",
+    ] = None,
     overwrite: Annotated[
         bool,
         typer.Option("--overwrite/--no-overwrite", help="Re-run already-completed result files."),
@@ -168,10 +160,6 @@ def sweep(
         bool,
         typer.Option("--dry-run", help="Print the planned runs without executing any."),
     ] = False,
-    device_map: Annotated[
-        str,
-        typer.Option("--device-map", help="HuggingFace device_map for model loading."),
-    ] = "auto",
 ) -> None:
     """Execute the full multi-model CHD evaluation sweep."""
     # ── Parse inputs ──────────────────────────────────────────────────────
@@ -210,14 +198,28 @@ def sweep(
         typer.echo("ERROR: No models selected after filtering.", err=True)
         raise typer.Exit(1)
 
+    # ── Detect GPU count ─────────────────────────────────────────────────
+    if num_gpus is None:
+        try:
+            import torch
+            num_gpus = max(1, torch.cuda.device_count())
+        except ImportError:
+            num_gpus = 1
+    typer.echo(f"GPUs to use: {num_gpus}")
+
     # ── Plan runs ────────────────────────────────────────────────────────
-    runs: list[tuple[ModelSpec, str, str]] = []  # (model, condition, method)
+    runs: list[tuple[ModelSpec, str, str]] = []
     for m in matrix:
         for cond in condition_list:
             for method in method_list:
                 runs.append((m, cond, method))
 
-    typer.echo(f"\n{'DRY RUN — ' if dry_run else ''}Planned {len(runs)} run(s):\n")
+    assignments = _distribute_models(matrix, num_gpus)
+    typer.echo(f"\n{'DRY RUN — ' if dry_run else ''}Planned {len(runs)} run(s) across {num_gpus} GPU(s):\n")
+    for gpu_id, specs in assignments.items():
+        for m in specs:
+            typer.echo(f"  GPU {gpu_id}  {m.slug:<28} [{m.size}]")
+    typer.echo("")
     for m, cond, method in runs:
         out = output_dir / m.slug / f"{cond}__{method}.jsonl"
         status = "[SKIP existing]" if (out.exists() and not overwrite) else ""
@@ -226,55 +228,124 @@ def sweep(
     if dry_run:
         return
 
-    # ── Judge provider (shared across all models) ─────────────────────────
-    judge_obj = None
-    if judge:
-        from episodic_log.judge import CHDJudge
-        from episodic_log.providers import get_provider
-        judge_provider = get_provider(judge_provider_spec)
-        judge_obj = CHDJudge(provider=judge_provider)
-        typer.echo(f"\nJudge provider: {judge_provider_spec}")
+    # ── Launch workers ────────────────────────────────────────────────────
+    if num_gpus == 1:
+        _gpu_worker(
+            gpu_id=0,
+            assigned_models=matrix,
+            condition_list=condition_list,
+            method_list=method_list,
+            sessions_meta=sessions_meta,
+            output_dir=output_dir,
+            overwrite=overwrite,
+        )
+    else:
+        ctx = mp.get_context("spawn")
+        processes: list[mp.Process] = []
+        for gpu_id, assigned_models in assignments.items():
+            if not assigned_models:
+                continue
+            p = ctx.Process(
+                target=_gpu_worker,
+                args=(gpu_id, assigned_models, condition_list, method_list,
+                      sessions_meta, output_dir, overwrite),
+                name=f"sweep-gpu{gpu_id}",
+            )
+            p.start()
+            processes.append(p)
+            typer.echo(f"Launched worker GPU {gpu_id} — {[m.slug for m in assigned_models]}")
 
-    # ── Main sweep ───────────────────────────────────────────────────────
-    for model_spec in matrix:
-        typer.echo(f"\n{'='*60}")
-        typer.echo(f"Loading model: {model_spec.spec}  [{model_spec.size}]")
-        typer.echo(f"{'='*60}")
+        for p in processes:
+            p.join()
+            if p.exitcode != 0:
+                logger.error("Worker %s exited with code %d", p.name, p.exitcode)
 
+    typer.echo("\nSweep complete. Run judge.py then score.py.")
+
+
+# ---------------------------------------------------------------------------
+# GPU worker (runs in a child process)
+# ---------------------------------------------------------------------------
+
+def _gpu_worker(
+    gpu_id: int,
+    assigned_models: list[ModelSpec],
+    condition_list: list[str],
+    method_list: list[str],
+    sessions_meta: list[dict],
+    output_dir: Path,
+    overwrite: bool,
+) -> None:
+    """Load and evaluate each assigned model sequentially on a single GPU.
+
+    Intended to run as a child process via ``multiprocessing.spawn``.
+    Sets ``CUDA_VISIBLE_DEVICES`` so the process owns exactly one GPU.
+
+    Args:
+        gpu_id: Physical GPU index to bind to.
+        assigned_models: Models this worker is responsible for.
+        condition_list: Condition names to evaluate.
+        method_list: Summarizer methods to evaluate.
+        sessions_meta: Pre-loaded session index records.
+        output_dir: Root results directory.
+        overwrite: Whether to overwrite existing result files.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s %(levelname)s [GPU{gpu_id}] %(name)s: %(message)s",
+    )
+    worker_logger = logging.getLogger(__name__)
+
+    for model_spec in assigned_models:
+        worker_logger.info("Loading %s", model_spec.spec)
         try:
-            provider = _load_provider(model_spec.spec, device_map=device_map)
+            provider = _load_provider(model_spec.spec, device_map="cuda:0")
         except Exception as exc:
-            logger.error("Failed to load model %s: %s", model_spec.spec, exc, exc_info=True)
+            worker_logger.error("Failed to load %s: %s", model_spec.spec, exc, exc_info=True)
             continue
 
         for cond_name in condition_list:
             for method in method_list:
                 out_path = output_dir / model_spec.slug / f"{cond_name}__{method}.jsonl"
                 if out_path.exists() and not overwrite:
-                    typer.echo(f"  Skipping {cond_name}/{method} — already exists.")
+                    worker_logger.info("Skipping %s/%s — exists", cond_name, method)
                     continue
-
-                typer.echo(f"  Running {cond_name}/{method} on {len(sessions_meta)} sessions …")
+                worker_logger.info("Running %s/%s/%s", model_spec.slug, cond_name, method)
                 _run_condition(
                     provider=provider,
                     condition_name=cond_name,
                     summary_method=method,
                     sessions_meta=sessions_meta,
                     output_path=out_path,
-                    judge_obj=judge_obj,
                     model_slug=model_spec.slug,
                 )
 
-        # Unload model and free GPU memory before next model.
         _unload_provider(provider)
         del provider
-
-    typer.echo("\nSweep complete. Run score.py to view results.")
+        worker_logger.info("Finished all conditions for %s", model_spec.slug)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _distribute_models(matrix: list[ModelSpec], num_gpus: int) -> dict[int, list[ModelSpec]]:
+    """Assign models to GPUs round-robin by index.
+
+    Args:
+        matrix: Full list of models to distribute.
+        num_gpus: Number of available GPUs.
+
+    Returns:
+        Dict mapping GPU index → list of assigned ModelSpecs.
+    """
+    assignments: dict[int, list[ModelSpec]] = {i: [] for i in range(num_gpus)}
+    for idx, model_spec in enumerate(matrix):
+        assignments[idx % num_gpus].append(model_spec)
+    return assignments
+
 
 def _load_provider(spec: str, device_map: str = "auto"):
     from episodic_log.providers import get_provider
@@ -301,7 +372,6 @@ def _run_condition(
     summary_method: str,
     sessions_meta: list[dict],
     output_path: Path,
-    judge_obj,
     model_slug: str,
 ) -> None:
     cond = get_condition(condition_name, provider=provider, summary_method=summary_method)
@@ -313,6 +383,8 @@ def _run_condition(
         desc=f"{model_slug[:18]}/{condition_name}/{summary_method}",
         unit="session",
         dynamic_ncols=True,
+        position=0,
+        leave=True,
     )
     with output_path.open("w", encoding="utf-8") as fh:
         for meta in bar:
@@ -350,17 +422,6 @@ def _run_condition(
                 "confidence": None,
                 "judge_reason": None,
             }
-
-            if judge_obj is not None:
-                verdict = judge_obj.judge(
-                    question=result.question,
-                    ground_truth=meta["answer"],
-                    predicted=result.predicted_answer,
-                )
-                record["verdict"] = verdict.verdict
-                record["confidence"] = verdict.confidence
-                record["judge_reason"] = verdict.reason
-
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             bar.set_postfix({"failed": failed})
 

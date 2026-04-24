@@ -78,7 +78,7 @@ The agent **cannot write to its own log** — the episodic log is append-only an
 | Qwen2.5-7B-Instruct | `qwen-2.5-7b` | small | qwen |
 | gemma-2-9b-it | `gemma-2-9b` | small | gemma |
 | Mistral-7B-Instruct-v0.3 | `mistral-7b` | small | mistral |
-| Qwen2.5-14B-Instruct | `qwen-2.5-14b` | medium | qwen |
+| Qwen2.5-14B-Instruct (4-bit) | `qwen-2.5-14b-4bit` | medium | qwen |
 | gemma-2-27b-it (4-bit) | `gemma-2-27b-4bit` | medium | gemma |
 | Qwen2.5-32B-Instruct (4-bit) | `qwen-2.5-32b-4bit` | large | qwen |
 | Llama-3.3-70B-Instruct (4-bit) | `llama-3.3-70b-4bit` | large | llama |
@@ -136,7 +136,7 @@ python scripts/judge.py --judge-provider groq:llama-3.1-70b-versatile
 python scripts/score.py
 ```
 
-### Option B — Full 500-session GPU sweep (H100)
+### Option B — Full 500-session sweep on 8× A100 80 GB
 
 ```bash
 # Step 1: Ingest all 500 sessions
@@ -147,23 +147,18 @@ python scripts/summarize.py --method structured
 python scripts/summarize.py --method haiku --provider hf:Qwen/Qwen2.5-7B-Instruct
 python scripts/summarize.py --method self  --provider hf:Qwen/Qwen2.5-7B-Instruct
 
-# Step 3: Multi-model sweep — loads/unloads each model automatically
-# All 9 models × all 7 conditions × structured summaries
-python scripts/run_sweep.py
+# Step 3: Multi-model sweep — 8 models run in parallel across 8 GPUs
+# All 9 models × all 7 conditions × all 3 summary methods
+python scripts/run_sweep.py --summary-methods structured,haiku,self
 
-# Small models only, two conditions
-python scripts/run_sweep.py --size-filter small --conditions baseline,episodic
-
-# Single model
-python scripts/run_sweep.py \
-    --model hf:Qwen/Qwen2.5-7B-Instruct \
-    --conditions baseline,episodic,proactive
-
-# Dry-run to see the plan first
+# Dry-run to see the GPU assignment plan first
 python scripts/run_sweep.py --dry-run
 
-# Step 4: Batch judge all results
-python scripts/judge.py --judge-provider groq:llama-3.1-70b-versatile
+# Override GPU count
+python scripts/run_sweep.py --num-gpus 4
+
+# Step 4: Local HF judge across all 8 GPUs — no API calls, no rate limits
+python scripts/judge.py --judge-provider hf:Qwen/Qwen2.5-14B-Instruct
 
 # Step 5: Score with per-question-type breakdown
 python scripts/score.py --breakdown
@@ -252,8 +247,9 @@ hf:Qwen/Qwen2.5-72B-Instruct:4bit
 |---|---|
 | Groq-only (ingest + judge + score) | Any CPU |
 | Small models (7–9B, BF16) | 24 GB VRAM (A10 / 3090) |
-| Medium models (14–27B, 4-bit) | 40 GB VRAM (A100 40GB) |
-| Large models (32–72B, 4-bit) | 80 GB VRAM (H100 / A100 80GB) |
+| Medium models (14–27B, BF16) | 80 GB VRAM (A100 / H100) |
+| Large models (32–72B, 4-bit) | 80 GB VRAM (A100 / H100) |
+| Full 9-model parallel sweep | 8× A100 80 GB (recommended) |
 
 ---
 
