@@ -26,7 +26,10 @@ _SYNTHETIC_EPOCH = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 _TURN_ID_WIDTH = 4
 
 # HuggingFace dataset coordinates.
+# longmemeval_s_cleaned.json contains single-session instances WITH session_history.
+# longmemeval_oracle.json has Q&A metadata only (no session_history).
 _HF_DATASET_NAME = "xiaowu0162/longmemeval-cleaned"
+_HF_SESSION_FILE = "longmemeval_s_cleaned.json"
 _HF_ORACLE_FILE = "longmemeval_oracle.json"
 
 
@@ -199,13 +202,17 @@ class LongMemEvalIngestor:
 
     @staticmethod
     def load_dataset(n: int | None = None, seed: int = 42) -> list[dict[str, Any]]:
-        """Load LongMemEval from HuggingFace by downloading the oracle JSON directly.
+        """Load LongMemEval from HuggingFace, merging session histories with oracle metadata.
 
-        Downloads ``longmemeval_oracle.json`` (15 MB, 500 examples) from
-        ``xiaowu0162/longmemeval-cleaned`` via ``huggingface_hub``.  The
-        ``datasets`` library is intentionally bypassed because the repo also
-        contains a 2.7 GB multi-session file that overflows PyArrow's int32
-        block-size when the library tries to process all files at once.
+        Downloads ``longmemeval_s_cleaned.json`` (277 MB, single-session instances with
+        ``session_history``) and ``longmemeval_oracle.json`` (15 MB, Q&A oracle metadata)
+        from ``xiaowu0162/longmemeval-cleaned`` via ``huggingface_hub``.  The ``datasets``
+        library is intentionally bypassed because the repo also contains a 2.7 GB
+        multi-session file that overflows PyArrow's int32 block-size.
+
+        The two files are merged on ``question_id``: oracle fields
+        (``answer``, ``evidence_session_ids``) are overlaid onto session instances so
+        the returned dicts always contain both ``session_history`` and oracle ground truth.
 
         The returned list is shuffled with *seed* for reproducibility; when *n*
         is provided only the first *n* instances after shuffling are returned.
@@ -235,25 +242,58 @@ class LongMemEvalIngestor:
                 "huggingface_hub is required. Install it with: pip install huggingface-hub"
             ) from exc
 
+        # Load single-session instances (has session_history).
+        logger.info(
+            "Downloading %s / %s from HuggingFace…",
+            _HF_DATASET_NAME,
+            _HF_SESSION_FILE,
+        )
+        session_path = hf_hub_download(
+            repo_id=_HF_DATASET_NAME,
+            filename=_HF_SESSION_FILE,
+            repo_type="dataset",
+        )
+        with open(session_path, "r", encoding="utf-8") as fh:
+            session_instances: list[dict[str, Any]] = json.load(fh)
+
+        # Load oracle metadata (has ground-truth answers + evidence_session_ids).
         logger.info(
             "Downloading %s / %s from HuggingFace…",
             _HF_DATASET_NAME,
             _HF_ORACLE_FILE,
         )
-        local_path = hf_hub_download(
+        oracle_path = hf_hub_download(
             repo_id=_HF_DATASET_NAME,
             filename=_HF_ORACLE_FILE,
             repo_type="dataset",
         )
-        with open(local_path, "r", encoding="utf-8") as fh:
-            instances: list[dict[str, Any]] = json.load(fh)
+        with open(oracle_path, "r", encoding="utf-8") as fh:
+            oracle_instances: list[dict[str, Any]] = json.load(fh)
+
+        # Build oracle lookup: question_id → oracle dict.
+        oracle_by_id: dict[str, dict[str, Any]] = {
+            inst["question_id"]: inst for inst in oracle_instances
+        }
+
+        # Merge oracle fields into session instances.
+        instances: list[dict[str, Any]] = []
+        for inst in session_instances:
+            qid = inst.get("question_id", "")
+            merged = dict(inst)
+            if qid in oracle_by_id:
+                # Oracle fields take precedence for answer/evidence — they are
+                # the ground-truth labels; session fields provide the history.
+                for key in ("answer", "evidence_session_ids", "question_type", "question"):
+                    if key in oracle_by_id[qid]:
+                        merged[key] = oracle_by_id[qid][key]
+            instances.append(merged)
 
         rng = random.Random(seed)
         rng.shuffle(instances)
         if n is not None:
             instances = instances[:n]
 
-        logger.info("Loaded %d LongMemEval instances.", len(instances))
+        logger.info("Loaded %d LongMemEval instances (with session_history).", len(instances))
         return instances
 
     # ------------------------------------------------------------------
