@@ -1,30 +1,33 @@
 """Run evaluation conditions on ingested LongMemEval sessions.
 
+Sessions are split evenly across all available GPUs so every worker loads the
+model once and processes its chunk in parallel — identical pattern to summarize.py.
+
 Usage
 -----
-# Amnesiac — 5 sessions, local 8B model
+# Amnesiac — 5 sessions, Qwen 7B
 python scripts/evaluate.py --condition amnesiac --n 5 \
-    --provider hf:meta-llama/Llama-3.1-8B-Instruct
+    --provider hf:Qwen/Qwen2.5-7B-Instruct
 
-# Recall + 72B 4-bit, lexical summaries
+# Recall/lexical — all sessions, 4 GPUs auto-detected
 python scripts/evaluate.py --condition recall --summary-method lexical \
-    --provider hf:Qwen/Qwen2.5-72B-Instruct:4bit
+    --provider hf:Qwen/Qwen2.5-7B-Instruct
 
-# All sessions with Groq + CHD judge
-python scripts/evaluate.py --condition recall \
-    --provider groq:llama-3.3-70b-versatile \
-    --judge --judge-provider groq:llama-3.1-70b-versatile
+# Recall/scout — 32B BF16 across 4 H100s (1 GPU each, fits 80GB)
+python scripts/evaluate.py --condition recall --summary-method scout \
+    --provider hf:Qwen/Qwen2.5-32B-Instruct
 
-# Explicit model slug (overrides auto-derived name in output path)
-python scripts/evaluate.py --condition amnesiac \
-    --provider hf:Qwen/Qwen2.5-7B-Instruct \
-    --model-slug qwen-2.5-7b
+# Force GPU count
+python scripts/evaluate.py --condition recall --summary-method echo \
+    --provider hf:Qwen/Qwen2.5-7B-Instruct --num-gpus 4
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
+import os
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -61,11 +64,14 @@ def evaluate(
     ] = "amnesiac",
     provider_spec: Annotated[
         str,
-        typer.Option("--provider", help="Provider spec (e.g. groq:llama-3.1-8b-instant)."),
+        typer.Option("--provider", help="Provider spec (e.g. hf:Qwen/Qwen2.5-7B-Instruct)."),
     ] = "groq:llama-3.1-8b-instant",
     summary_method: Annotated[
         str,
-        typer.Option("--summary-method", help="Summary method for retrieval conditions."),
+        typer.Option(
+            "--summary-method",
+            help="Summary index to use for recall conditions: lexical | scout | echo.",
+        ),
     ] = "lexical",
     n: Annotated[
         int | None,
@@ -77,153 +83,234 @@ def evaluate(
     ] = Path("data/sessions_index.jsonl"),
     output_dir: Annotated[
         Path,
-        typer.Option(help="Directory for results JSONL output."),
+        typer.Option(help="Root directory for results JSONL files."),
     ] = Path("data/results"),
-    judge: Annotated[
-        bool,
-        typer.Option("--judge/--no-judge", help="Run CHD judge on each prediction."),
-    ] = False,
-    judge_provider_spec: Annotated[
-        str,
-        typer.Option("--judge-provider", help="Provider spec for the CHD judge."),
-    ] = "groq:llama-3.1-70b-versatile",
+    num_gpus: Annotated[
+        int | None,
+        typer.Option(
+            "--num-gpus",
+            help="Total GPUs to use (default: all available). Ignored for CPU-only providers.",
+        ),
+    ] = None,
+    gpus_per_worker: Annotated[
+        int,
+        typer.Option(
+            "--gpus-per-worker",
+            help="GPUs per worker (default 1). Use 2 for 70B BF16 models.",
+        ),
+    ] = 1,
     model_slug: Annotated[
         str | None,
         typer.Option(
             "--model-slug",
-            help=(
-                "Short identifier used in the output path (data/results/<model-slug>/). "
-                "Auto-derived from --provider if omitted."
-            ),
+            help="Short name used in output path. Auto-derived from --provider if omitted.",
         ),
     ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Overwrite existing result files."),
+    ] = False,
 ) -> None:
-    """Run *condition* on all sessions and write per-result JSONL."""
+    """Run *condition* on all sessions, parallelised across GPUs."""
     if condition not in ALL_CONDITIONS:
-        typer.echo(f"ERROR: Unknown condition '{condition}'. Available: {ALL_CONDITIONS}", err=True)
+        typer.echo(
+            f"ERROR: Unknown condition {condition!r}. Available: {sorted(ALL_CONDITIONS)}",
+            err=True,
+        )
         raise typer.Exit(1)
 
     if not sessions_index.exists():
-        typer.echo(f"ERROR: sessions index not found at {sessions_index}. Run ingest.py first.", err=True)
+        typer.echo(
+            f"ERROR: sessions index not found at {sessions_index}. Run ingest.py first.",
+            err=True,
+        )
         raise typer.Exit(1)
 
-    from episodic_log.providers import get_provider
-    from episodic_log.ingestor.longmemeval import IngestedSession
-
-    provider = get_provider(provider_spec)
-    cond = get_condition(condition, provider=provider, summary_method=summary_method)
-
-    judge_obj = None
-    if judge:
-        from episodic_log.judge import CHDJudge
-        judge_provider = get_provider(judge_provider_spec)
-        judge_obj = CHDJudge(provider=judge_provider)
-
-    sessions_meta = _load_index(sessions_index)
+    all_sessions = _load_index(sessions_index)
     if n is not None:
-        sessions_meta = sessions_meta[:n]
+        all_sessions = all_sessions[:n]
 
     slug = model_slug or _derive_slug(provider_spec)
-    typer.echo(f"Model slug: {slug}")
-    typer.echo(f"Running condition={condition!r} on {len(sessions_meta)} sessions …")
-
     model_output_dir = output_dir / slug
     model_output_dir.mkdir(parents=True, exist_ok=True)
+
+    cond_label = condition if condition == "amnesiac" else f"{condition}/{summary_method}"
     output_path = model_output_dir / f"{condition}__{summary_method}.jsonl"
 
-    failed = 0
-    iterator = tqdm(sessions_meta, desc=f"{condition}/{summary_method}", unit="session", dynamic_ncols=True)
+    if not overwrite and output_path.exists() and output_path.stat().st_size > 0:
+        typer.echo(f"Already complete: {output_path}. Use --overwrite to re-run.")
+        return
 
-    with output_path.open("w", encoding="utf-8") as out_fh:
-        for meta in iterator:
-            session = IngestedSession(
-                session_id=meta["session_id"],
-                log_path=Path(meta["log_path"]),
-                summaries_dir=Path(meta["summaries_dir"]),
-                question=meta["question"],
-                answer=meta["answer"],
-                evidence_turn_ids=meta["evidence_turn_ids"],
-                question_type=meta["question_type"],
-                question_id=meta["question_id"],
+    typer.echo(
+        f"Condition: {cond_label!r}  |  Model: {slug}  |  Sessions: {len(all_sessions)}"
+    )
+
+    # Detect GPU count for HF providers.
+    is_hf = provider_spec.startswith("hf:")
+    if is_hf and num_gpus is None:
+        try:
+            import torch
+            num_gpus = max(1, torch.cuda.device_count())
+        except ImportError:
+            num_gpus = 1
+
+    if not is_hf or num_gpus is None:
+        num_gpus = 1
+
+    num_workers = max(1, num_gpus // gpus_per_worker)
+    typer.echo(
+        f"Provider: {provider_spec}  |  GPUs: {num_gpus}  |  "
+        f"Workers: {num_workers}  |  GPUs/worker: {gpus_per_worker}"
+    )
+
+    all_gpu_ids = list(range(num_gpus))
+    worker_devices: list[str] = [
+        ",".join(str(g) for g in all_gpu_ids[i * gpus_per_worker:(i + 1) * gpus_per_worker])
+        for i in range(num_workers)
+    ]
+
+    # Each worker writes to a temp shard; main process merges them.
+    shard_paths = [
+        model_output_dir / f".{condition}__{summary_method}__shard{i}.jsonl"
+        for i in range(num_workers)
+    ]
+    chunks = _split_sessions(all_sessions, num_workers)
+
+    if num_workers == 1:
+        _run_worker(
+            cuda_devices=worker_devices[0] if is_hf else None,
+            sessions=all_sessions,
+            condition=condition,
+            summary_method=summary_method,
+            provider_spec=provider_spec,
+            shard_path=shard_paths[0],
+        )
+    else:
+        ctx = mp.get_context("spawn")
+        processes: list[mp.Process] = []
+        for i, (cuda_devs, chunk, shard) in enumerate(
+            zip(worker_devices, chunks, shard_paths)
+        ):
+            if not chunk:
+                continue
+            p = ctx.Process(
+                target=_run_worker,
+                args=(cuda_devs, chunk, condition, summary_method, provider_spec, shard),
+                name=f"eval-worker{i}",
             )
+            p.start()
+            processes.append(p)
+            typer.echo(f"  Worker {i} (GPUs {cuda_devs}): {len(chunk)} sessions")
 
+        for p in processes:
+            p.join()
+            if p.exitcode != 0:
+                logger.error("Worker %s exited with code %d", p.name, p.exitcode)
+
+    # Merge shards into final output file.
+    total = 0
+    with output_path.open("w", encoding="utf-8") as out_fh:
+        for shard in shard_paths:
+            if shard.exists():
+                for line in shard.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        out_fh.write(line + "\n")
+                        total += 1
+                shard.unlink()
+
+    typer.echo(f"Done. {total} results → {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+def _run_worker(
+    cuda_devices: str | None,
+    sessions: list[dict],
+    condition: str,
+    summary_method: str,
+    provider_spec: str,
+    shard_path: Path,
+) -> None:
+    """Load model once, run condition on every session in this chunk."""
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+        logging.basicConfig(
+            level=logging.INFO,
+            format=f"%(asctime)s %(levelname)s [GPU{cuda_devices}] %(name)s: %(message)s",
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
+    worker_logger = logging.getLogger(__name__)
+
+    from episodic_log.providers import get_provider
+    device_map = "auto" if cuda_devices is not None else "cpu"
+    provider = get_provider(provider_spec, device_map=device_map)
+
+    cond = get_condition(condition)
+
+    tag = f"GPU{cuda_devices}" if cuda_devices is not None else "CPU"
+    bar = tqdm(
+        sessions,
+        desc=f"{tag}/{condition}/{summary_method}",
+        unit="session",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+    failed = 0
+    written = 0
+
+    with shard_path.open("w", encoding="utf-8") as fh:
+        for meta in bar:
             try:
-                result = cond.run(session, session.question)
+                result = cond.run(session_meta=meta, provider=provider)
             except Exception as exc:
-                logger.error("Session %s failed: %s", session.session_id, exc, exc_info=True)
+                worker_logger.error(
+                    "Session %s failed: %s", meta.get("session_id"), exc, exc_info=True
+                )
                 failed += 1
+                bar.set_postfix({"written": written, "failed": failed})
                 continue
 
-            record: dict = {
+            record = {
                 "session_id": result.session_id,
-                "condition": result.condition_name,
-                "summary_method": summary_method,
+                "question_id": result.question_id,
+                "condition": result.condition,
+                "summary_method": result.summary_method,
                 "question": result.question,
-                "ground_truth": meta["answer"],
+                "ground_truth": result.ground_truth,
                 "predicted_answer": result.predicted_answer,
-                "retrieved_turn_ids": result.retrieved_turn_ids,
-                "evidence_turn_ids": meta["evidence_turn_ids"],
-                "num_retrieval_calls": result.num_retrieval_calls,
-                "question_type": meta["question_type"],
-                "metadata": result.metadata,
+                "tool_calls": result.tool_calls,
+                "turns_loaded": result.turns_loaded,
+                "evidence_turn_ids": meta.get("evidence_turn_ids", []),
+                "question_type": meta.get("question_type", ""),
                 "verdict": None,
                 "confidence": None,
                 "judge_reason": None,
             }
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            written += 1
+            bar.set_postfix({"written": written, "failed": failed})
 
-            if judge_obj is not None:
-                verdict = judge_obj.judge(
-                    question=result.question,
-                    ground_truth=meta["answer"],
-                    predicted=result.predicted_answer,
-                )
-                record["verdict"] = verdict.verdict
-                record["confidence"] = verdict.confidence
-                record["judge_reason"] = verdict.reason
-
-            out_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            iterator.set_postfix({"last": session.session_id[:20], "failed": failed})
-
-    typer.echo(
-        f"Done. Results written to {output_path}  (failed={failed})"
+    worker_logger.info(
+        "%s: done — written=%d  failed=%d  total=%d",
+        tag, written, failed, len(sessions),
     )
 
 
-def _derive_slug(provider_spec: str) -> str:
-    """Derive a filesystem-safe short slug from a provider spec string.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    Examples:
-        ``groq:llama-3.1-8b-instant`` → ``llama-3.1-8b-instant``
-        ``hf:Qwen/Qwen2.5-72B-Instruct:4bit`` → ``qwen2.5-72b-4bit``
-        ``hf:meta-llama/Llama-3.1-8B-Instruct`` → ``llama-3.1-8b``
-    """
-    parts = provider_spec.split(":")
-    # Strip backend prefix.
-    if parts[0].lower() in ("groq", "hf", "huggingface"):
-        rest = ":".join(parts[1:])
-    else:
-        rest = provider_spec
-
-    # For hf specs: take model name after org/, strip quantization suffix.
-    quant_suffix = ""
-    if rest.endswith(":4bit"):
-        quant_suffix = "-4bit"
-        rest = rest[:-5]
-    elif rest.endswith(":8bit"):
-        quant_suffix = "-8bit"
-        rest = rest[:-5]
-
-    # Use only the model name after org slash.
-    model_part = rest.split("/")[-1]
-    slug = model_part.lower().replace("_", "-")
-    # Remove common verbose tokens (suffix or mid-string before version tag).
-    for token in ("-instruct", "-it", "-chat", "-hf"):
-        # Remove as suffix.
-        if slug.endswith(token):
-            slug = slug[: -len(token)]
-        # Remove mid-string (e.g. -instruct-v0.3 → -v0.3).
-        slug = slug.replace(token + "-", "-")
-    return slug + quant_suffix
+def _split_sessions(sessions: list[dict], n: int) -> list[list[dict]]:
+    chunk_size = (len(sessions) + n - 1) // n
+    return [sessions[i: i + chunk_size] for i in range(0, len(sessions), chunk_size)]
 
 
 def _load_index(path: Path) -> list[dict]:
@@ -234,6 +321,28 @@ def _load_index(path: Path) -> list[dict]:
             if stripped:
                 records.append(json.loads(stripped))
     return records
+
+
+def _derive_slug(provider_spec: str) -> str:
+    parts = provider_spec.split(":")
+    if parts[0].lower() in ("groq", "hf", "huggingface"):
+        rest = ":".join(parts[1:])
+    else:
+        rest = provider_spec
+    quant_suffix = ""
+    if rest.endswith(":4bit"):
+        quant_suffix = "-4bit"
+        rest = rest[:-5]
+    elif rest.endswith(":8bit"):
+        quant_suffix = "-8bit"
+        rest = rest[:-5]
+    model_part = rest.split("/")[-1]
+    slug = model_part.lower().replace("_", "-")
+    for token in ("-instruct", "-it", "-chat", "-hf"):
+        if slug.endswith(token):
+            slug = slug[: -len(token)]
+        slug = slug.replace(token + "-", "-")
+    return slug + quant_suffix
 
 
 if __name__ == "__main__":
