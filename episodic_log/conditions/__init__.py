@@ -1,65 +1,55 @@
-"""Evaluation conditions for CHD measurement on LongMemEval."""
+"""Condition registry for the CHD evaluation harness.
 
-from episodic_log.conditions.adversarial import AdversarialCondition
+Provides :data:`ALL_CONDITIONS`, a pre-instantiated mapping of every supported
+condition name to its :class:`~episodic_log.conditions.base.BaseCondition`
+instance, and :func:`get_condition` for validated lookup.
+
+Supported condition names
+-------------------------
+- ``"amnesiac"``         — no memory, pure parametric knowledge.
+- ``"recall/lexical"``   — tool-use recall with a lexical summary index.
+- ``"recall/scout"``     — tool-use recall with a scout summary index.
+- ``"recall/echo"``      — tool-use recall with an echo summary index.
+"""
+
+from __future__ import annotations
+
+from episodic_log.conditions.amnesiac import AmnesiacCondition
 from episodic_log.conditions.base import BaseCondition, ConditionResult
-from episodic_log.conditions.baseline import BaselineCondition
-from episodic_log.conditions.episodic import EpisodicCondition
-from episodic_log.conditions.external import ExternalCondition
-from episodic_log.conditions.full_context import FullContextCondition
-from episodic_log.conditions.md_memory import MdMemoryCondition
-from episodic_log.conditions.proactive import ProactiveCondition
-
-ALL_CONDITIONS: list[str] = [
-    "baseline",
-    "episodic",
-    "adversarial",
-    "proactive",
-    "external",
-    "md_memory",
-    "full_context",
-]
-
-_REGISTRY: dict[str, type[BaseCondition]] = {
-    "baseline": BaselineCondition,
-    "episodic": EpisodicCondition,
-    "adversarial": AdversarialCondition,
-    "proactive": ProactiveCondition,
-    "external": ExternalCondition,
-    "md_memory": MdMemoryCondition,
-    "full_context": FullContextCondition,
-}
-
-
-def get_condition(name: str, **kwargs) -> BaseCondition:
-    """Instantiate a condition by name.
-
-    Args:
-        name: One of :data:`ALL_CONDITIONS`.
-        **kwargs: Forwarded to the condition constructor (e.g. ``provider=``, ``summary_method=``).
-
-    Returns:
-        An initialised :class:`~episodic_log.conditions.base.BaseCondition` subclass.
-
-    Raises:
-        KeyError: If *name* is not a registered condition.
-    """
-    if name not in _REGISTRY:
-        raise KeyError(
-            f"Unknown condition '{name}'. Available: {sorted(_REGISTRY)}"
-        )
-    return _REGISTRY[name](**kwargs)
-
+from episodic_log.conditions.recall import RecallCondition
 
 __all__ = [
     "ALL_CONDITIONS",
     "get_condition",
+    "AmnesiacCondition",
+    "RecallCondition",
     "BaseCondition",
     "ConditionResult",
-    "BaselineCondition",
-    "EpisodicCondition",
-    "AdversarialCondition",
-    "ProactiveCondition",
-    "ExternalCondition",
-    "MdMemoryCondition",
-    "FullContextCondition",
 ]
+
+ALL_CONDITIONS: dict[str, BaseCondition] = {
+    "amnesiac": AmnesiacCondition(),
+    "recall/lexical": RecallCondition("lexical"),
+    "recall/scout": RecallCondition("scout"),
+    "recall/echo": RecallCondition("echo"),
+}
+
+
+def get_condition(name: str) -> BaseCondition:
+    """Return the condition registered under *name*.
+
+    Args:
+        name: One of the keys in :data:`ALL_CONDITIONS`.
+
+    Returns:
+        The corresponding :class:`~episodic_log.conditions.base.BaseCondition`
+        instance.
+
+    Raises:
+        ValueError: If *name* is not a registered condition.
+    """
+    if name not in ALL_CONDITIONS:
+        raise ValueError(
+            f"Unknown condition: {name!r}. Available: {sorted(ALL_CONDITIONS)}"
+        )
+    return ALL_CONDITIONS[name]

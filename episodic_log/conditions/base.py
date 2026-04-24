@@ -4,68 +4,101 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
 
-from episodic_log.ingestor.longmemeval import IngestedSession
 from episodic_log.providers.base import BaseProvider
 
 
 @dataclass
 class ConditionResult:
-    """Result of running one condition on one session.
+    """Structured result from running a single condition on a single session question.
 
     Attributes:
-        condition_name: Name of the condition (e.g. ``"baseline"``, ``"episodic"``).
-        session_id: Session identifier from :class:`~episodic_log.ingestor.longmemeval.IngestedSession`.
-        question: The evaluation question.
-        predicted_answer: The model's answer string.
-        retrieved_turn_ids: Turn IDs fetched from the log (empty for non-retrieval conditions).
-        num_retrieval_calls: Number of BM25 retrieval calls made during answering.
-        metadata: Optional extra data (timing, token counts, etc.).
+        session_id: Identifier of the session being evaluated.
+        question_id: Identifier of the question within the session.
+        question: The evaluation question text.
+        ground_truth: The expected correct answer.
+        predicted_answer: The model's generated answer.
+        condition: Condition label, one of ``"amnesiac"``, ``"recall/lexical"``,
+            ``"recall/scout"``, or ``"recall/echo"``.
+        summary_method: Summarizer variant used to build the index; ``None`` for
+            amnesiac (no index).
+        tool_calls: Serialized :class:`~episodic_log.agent.trace.ToolCallRecord`
+            dicts, empty for amnesiac.
+        turns_loaded: Turn IDs loaded from the log during answering, empty for
+            amnesiac.
     """
 
-    condition_name: str
     session_id: str
+    question_id: str
     question: str
+    ground_truth: str
     predicted_answer: str
-    retrieved_turn_ids: list[str] = field(default_factory=list)
-    num_retrieval_calls: int = 0
-    metadata: dict[str, Any] = field(default_factory=dict)
+    condition: str
+    summary_method: str | None
+    tool_calls: list[dict] = field(default_factory=list)
+    turns_loaded: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialise this result to a plain dictionary for JSON export.
+
+        Returns:
+            Dictionary representation of the result with all fields serialised
+            to JSON-compatible types.
+        """
+        return {
+            "session_id": self.session_id,
+            "question_id": self.question_id,
+            "question": self.question,
+            "ground_truth": self.ground_truth,
+            "predicted_answer": self.predicted_answer,
+            "condition": self.condition,
+            "summary_method": self.summary_method,
+            "tool_calls": self.tool_calls,
+            "turns_loaded": self.turns_loaded,
+        }
 
 
 class BaseCondition(ABC):
-    """Abstract condition that defines how a model answers a LongMemEval question.
+    """Abstract condition encoding one memory strategy for CHD evaluation.
 
-    Each concrete subclass encodes one memory strategy (e.g. no memory, BM25
-    retrieval, full context injection) and returns a :class:`ConditionResult`.
+    Each concrete subclass implements a distinct approach to answering questions
+    about past conversations.  All conditions receive a ``session_meta`` dict
+    rather than a typed object to remain loosely coupled to the ingestor layer.
 
-    Args:
-        provider: An initialised :class:`~episodic_log.providers.base.BaseProvider`.
-        summary_method: Summarizer method to use for BM25 index construction.
-            Ignored by conditions that do not perform retrieval.
+    ``session_meta`` must contain the following keys:
 
-    Raises:
-        TypeError: If *provider* is not a :class:`~episodic_log.providers.base.BaseProvider`.
+    - ``session_id`` (str): Unique session identifier.
+    - ``question_id`` (str): Unique question identifier.
+    - ``question`` (str): Free-text question to answer.
+    - ``answer`` (str): Ground-truth answer string.
+    - ``log_path`` (str): Path to the raw conversation log file.
+    - ``summaries_dir`` (str): Directory containing pre-built summary index files.
+    - ``evidence_turn_ids`` (list[str]): Turn IDs that contain the ground-truth evidence.
+    - ``question_type`` (str): Category label for the question.
     """
 
-    name: str = "base"
-
-    def __init__(self, provider: BaseProvider, summary_method: str = "structured") -> None:
-        if not isinstance(provider, BaseProvider):
-            raise TypeError(f"provider must be a BaseProvider, got {type(provider)}")
-        self._provider = provider
-        self._summary_method = summary_method
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Canonical condition name used for logging and output labelling."""
+        raise NotImplementedError
 
     @abstractmethod
-    def run(self, session: IngestedSession, question: str) -> ConditionResult:
-        """Answer *question* using the strategy encoded by this condition.
+    def run(self, session_meta: dict, provider: BaseProvider) -> ConditionResult:
+        """Answer the question encoded in *session_meta* and return a result.
 
         Args:
-            session: Ingested session providing the log, summaries, and metadata.
-            question: Free-text question to answer.
+            session_meta: Metadata dict for the session/question (see class
+                docstring for required keys).
+            provider: Initialised LLM provider backend.
 
         Returns:
-            A :class:`ConditionResult` with the model's predicted answer and
-            any retrieval metadata.
+            :class:`ConditionResult` populated with the predicted answer and any
+            retrieval bookkeeping.
+
+        Raises:
+            KeyError: If a required key is missing from *session_meta*.
+            TypeError: If *provider* is not a
+                :class:`~episodic_log.providers.base.BaseProvider`.
         """
         raise NotImplementedError
