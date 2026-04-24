@@ -19,6 +19,7 @@ Message format:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 
 def normalize_messages(
@@ -82,5 +83,49 @@ class BaseProvider(ABC):
 
         Raises:
             RuntimeError: If the underlying provider call fails after all retries.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict],
+        system: str | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Run one inference step with tool-calling support.
+
+        The model may either produce a final text answer or request a tool call.
+        The caller is responsible for executing any requested tool, appending
+        the result to *messages*, and calling this method again until a text
+        response is received or a step budget is exhausted.
+
+        Args:
+            messages: Full conversation history as standard
+                ``{"role": ..., "content": ...}`` chat-message dicts.  Tool
+                result turns must follow the provider's native format.
+            tools: List of OpenAI-format tool schema dicts describing the
+                available functions (``{"type": "function", "function": {...}}``).
+            system: Optional system prompt injected before *messages*.
+            max_tokens: Upper bound on generated tokens.
+            temperature: Sampling temperature; 0.0 for deterministic decoding.
+
+        Returns:
+            A dict with the following keys:
+
+            - ``"type"`` (``str``): ``"tool_call"`` or ``"text"``.
+            - ``"content"`` (``str``): Final answer text when
+              ``type == "text"``; empty string otherwise.
+            - ``"tool_name"`` (``str``): Name of the requested tool when
+              ``type == "tool_call"``; empty string otherwise.
+            - ``"tool_args"`` (``dict``): Parsed argument dict for the tool
+              when ``type == "tool_call"``; empty dict otherwise.
+            - ``"raw_message"`` (``dict``): Full assistant message dict
+              suitable for appending to *messages* in the next turn.
+
+        Raises:
+            RuntimeError: If the underlying provider call fails.
         """
         raise NotImplementedError

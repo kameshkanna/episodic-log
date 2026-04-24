@@ -1,4 +1,4 @@
-"""Deterministic structured summarizer.
+"""Deterministic lexical summarizer.
 
 Produces summaries by extracting fields from a :class:`~episodic_log.core.turn_event.TurnEvent`
 into a fixed template.  No model inference is required — this is the cheapest
@@ -22,7 +22,7 @@ _TOOL_RESULT_CONTENT_LIMIT = 150
 _DEFAULT_CONTENT_LIMIT = 120
 
 
-class StructuredSummarizer(AbstractSummarizer):
+class LexicalSummarizer(AbstractSummarizer):
     """Deterministic, template-based summarizer with no model dependency.
 
     Produces a single-line summary by extracting metadata fields from a
@@ -44,8 +44,8 @@ class StructuredSummarizer(AbstractSummarizer):
 
     @property
     def method(self) -> str:
-        """Return the method identifier ``"structured"``."""
-        return "structured"
+        """Return the method identifier ``"lexical"``."""
+        return "lexical"
 
     def summarize(self, event: TurnEvent) -> TurnSummary:
         """Produce a deterministic one-line summary of *event*.
@@ -55,7 +55,7 @@ class StructuredSummarizer(AbstractSummarizer):
 
         Returns:
             A :class:`~episodic_log.core.turn_summary.TurnSummary` populated with
-            the template-formatted summary and ``method="structured"``.
+            the template-formatted summary and ``method="lexical"``.
 
         Raises:
             TypeError: If *event* is not a :class:`~episodic_log.core.turn_event.TurnEvent`.
@@ -73,7 +73,7 @@ class StructuredSummarizer(AbstractSummarizer):
         )
 
         logger.debug(
-            "StructuredSummarizer: session=%s turn=%s summary_len=%d",
+            "LexicalSummarizer: session=%s turn=%s summary_len=%d",
             event.session_id,
             event.turn_id,
             len(summary),
@@ -138,7 +138,7 @@ class StructuredSummarizer(AbstractSummarizer):
         try:
             parsed = json.loads(content)
         except (json.JSONDecodeError, ValueError):
-            logger.debug("StructuredSummarizer: non-JSON tool_call content, using raw truncation.")
+            logger.debug("LexicalSummarizer: non-JSON tool_call content, using raw truncation.")
             return _truncate(content, _DEFAULT_CONTENT_LIMIT)
 
         if not isinstance(parsed, dict):

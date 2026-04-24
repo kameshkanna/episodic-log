@@ -7,24 +7,24 @@ each worker spans multiple cards via ``device_map="auto"``.
 
 Usage
 -----
-# Structured (no model, CPU, fast)
-python scripts/summarize.py --method structured
+# Lexical (no model, CPU, fast)
+python scripts/summarize.py --method lexical
 
-# Haiku — small model, all 8 GPUs in parallel (1 GPU each)
-python scripts/summarize.py --method haiku \
+# Scout — small model, all 8 GPUs in parallel (1 GPU each)
+python scripts/summarize.py --method scout \
     --provider hf:Qwen/Qwen2.5-7B-Instruct
 
-# Haiku — 32B BF16, 8 workers × 1 GPU each (32 GB fits in 80 GB A100)
-python scripts/summarize.py --method haiku \
+# Scout — 32B BF16, 8 workers × 1 GPU each (32 GB fits in 80 GB A100)
+python scripts/summarize.py --method scout \
     --provider hf:Qwen/Qwen2.5-32B-Instruct
 
-# Self-summarizer with 70B BF16, 4 workers × 2 GPUs each
-python scripts/summarize.py --method self \
+# Echo summarizer with 70B BF16, 4 workers × 2 GPUs each
+python scripts/summarize.py --method echo \
     --provider hf:meta-llama/Llama-3.3-70B-Instruct \
     --gpus-per-worker 2
 
 # Explicit total GPU count
-python scripts/summarize.py --method haiku \
+python scripts/summarize.py --method scout \
     --provider hf:Qwen/Qwen2.5-7B-Instruct \
     --num-gpus 4
 """
@@ -67,10 +67,10 @@ def summarize(  # noqa: PLR0912
         str,
         typer.Option(
             "--method",
-            help="Summarizer method: structured | haiku | self.",
+            help="Summarizer method: lexical | scout | echo.",
             case_sensitive=False,
         ),
-    ] = "structured",
+    ] = "lexical",
     sessions_index: Annotated[
         Path,
         typer.Option(help="Path to sessions_index.jsonl produced by ingest.py."),
@@ -110,7 +110,7 @@ def summarize(  # noqa: PLR0912
     """Generate TurnSummary JSONL files for every session in the index.
 
     Args:
-        method: Summarizer method: ``structured`` | ``haiku`` | ``self``.
+        method: Summarizer method: ``lexical`` | ``scout`` | ``echo``.
         sessions_index: Path to the sessions index JSONL produced by ingest.py.
         provider_spec: Provider spec string for model-backed methods.
         num_gpus: Total GPUs to use (auto-detected if not set).
@@ -143,8 +143,8 @@ def summarize(  # noqa: PLR0912
         typer.echo("Nothing to do.")
         return
 
-    # Structured is CPU-only — no GPU, no parallelization needed.
-    if method == "structured":
+    # Lexical is CPU-only — no GPU, no parallelization needed.
+    if method == "lexical":
         _run_sessions(
             cuda_devices=None,
             sessions=pending,
@@ -157,7 +157,7 @@ def summarize(  # noqa: PLR0912
 
     # Model-backed methods: parallelize across GPUs.
     if provider_spec is None:
-        typer.echo("ERROR: --provider is required for haiku/self methods.", err=True)
+        typer.echo("ERROR: --provider is required for scout/echo methods.", err=True)
         raise typer.Exit(1)
 
     if num_gpus is None:
@@ -232,7 +232,7 @@ def _run_sessions(
             ``None`` for CPU-only methods.
         sessions: Session metadata records to process.
         method: Summarizer method name.
-        provider_spec: Provider spec string, or ``None`` for structured.
+        provider_spec: Provider spec string, or ``None`` for lexical.
         overwrite: Whether to overwrite existing summary files.
     """
     if cuda_devices is not None:

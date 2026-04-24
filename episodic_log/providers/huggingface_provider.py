@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
+import re
 from typing import Any
 
 from episodic_log.providers.base import BaseProvider, normalize_messages
@@ -277,6 +279,166 @@ class HuggingFaceProvider(BaseProvider):
         gc.collect()
 
         return text.strip()
+
+    def generate_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict],
+        system: str | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> dict[str, Any]:
+        """Run one inference step with tool-calling support for Qwen2.5-Instruct.
+
+        Uses ``apply_chat_template`` with the ``tools=`` parameter so that
+        Qwen2.5-Instruct models emit structured ``<tool_call>`` blocks when
+        they want to invoke a function.
+
+        The output is parsed as follows:
+
+        - If the decoded text contains a ``<tool_call>`` block, the JSON
+          payload is extracted and returned as a ``type="tool_call"`` response.
+        - Otherwise the text is returned as a ``type="text"`` response.
+
+        The ``raw_message`` field in the returned dict is always a complete
+        assistant message dict ready to be appended to *messages* before the
+        next call.  Tool result messages must use the Qwen-native format::
+
+            {"role": "tool", "content": <result_str>, "name": <tool_name>}
+
+        Args:
+            messages: Full conversation history as standard chat-message dicts.
+                Tool result turns should follow the Qwen tool-result format.
+            tools: List of OpenAI-format tool schema dicts.
+            system: Optional system prompt.
+            max_tokens: Maximum new tokens to generate.
+            temperature: Sampling temperature; 0.0 uses greedy decoding.
+
+        Returns:
+            Dict with keys ``"type"``, ``"content"``, ``"tool_name"``,
+            ``"tool_args"``, and ``"raw_message"``.  See
+            :meth:`~episodic_log.providers.base.BaseProvider.generate_with_tools`
+            for the full contract.
+
+        Raises:
+            RuntimeError: If generation or JSON parsing of a tool call fails.
+        """
+        import torch  # type: ignore[import]
+
+        chat: list[dict[str, Any]] = []
+        if system:
+            chat.append({"role": "system", "content": system})
+        chat.extend(messages)
+
+        try:
+            prompt: str = self._tokenizer.apply_chat_template(
+                chat,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "generate_with_tools: apply_chat_template with tools failed (%s); "
+                "falling back to tool-schema-free template.",
+                exc,
+            )
+            try:
+                prompt = self._tokenizer.apply_chat_template(
+                    chat,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                prompt = "\n".join(
+                    f"{m['role'].upper()}: {m['content']}" for m in chat
+                ) + "\nASSISTANT:"
+
+        inputs = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        device = next(self._model.parameters()).device
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        do_sample = temperature > 0.0
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(input_ids, **gen_kwargs)
+
+        new_ids = output_ids[0][input_ids.shape[-1]:]
+        raw_text: str = self._tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+        del input_ids, output_ids, new_ids
+        if attention_mask is not None:
+            del attention_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        # ------------------------------------------------------------------ #
+        # Parse tool call vs. plain text                                       #
+        # ------------------------------------------------------------------ #
+        tool_call_match = re.search(
+            r"<tool_call>\s*(.*?)\s*</tool_call>",
+            raw_text,
+            re.DOTALL,
+        )
+        if tool_call_match:
+            payload_str = tool_call_match.group(1)
+            try:
+                payload: dict[str, Any] = json.loads(payload_str)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"generate_with_tools: failed to parse tool_call JSON: {exc}\n"
+                    f"Raw payload: {payload_str!r}"
+                ) from exc
+
+            tool_name: str = payload.get("name", "")
+            tool_args: dict[str, Any] = payload.get("arguments", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            raw_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": raw_text,
+            }
+            logger.debug(
+                "generate_with_tools: tool_call detected name=%s args=%s",
+                tool_name,
+                tool_args,
+            )
+            return {
+                "type": "tool_call",
+                "content": "",
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "raw_message": raw_message,
+            }
+
+        # Plain text response — the model has produced a final answer.
+        raw_message = {"role": "assistant", "content": raw_text}
+        logger.debug("generate_with_tools: text response len=%d", len(raw_text))
+        return {
+            "type": "text",
+            "content": raw_text,
+            "tool_name": "",
+            "tool_args": {},
+            "raw_message": raw_message,
+        }
 
 
 def _build_bnb_config(quantization: str | None) -> Any | None:

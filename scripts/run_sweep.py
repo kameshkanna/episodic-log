@@ -14,7 +14,7 @@ Results are written to:
 Usage examples
 --------------
 # Full auto — detect hardware, run everything that fits
-python scripts/run_sweep.py --summary-methods structured,haiku,self
+python scripts/run_sweep.py --summary-methods lexical,scout,echo
 
 # Dry-run: see what would run and on how many GPUs
 python scripts/run_sweep.py --dry-run
@@ -26,7 +26,7 @@ python scripts/run_sweep.py --num-gpus 4 --vram-per-gpu 40
 python scripts/run_sweep.py --model hf:Qwen/Qwen2.5-7B-Instruct --num-gpus 1
 
 # Filter to small models only, two conditions
-python scripts/run_sweep.py --size-filter small --conditions baseline,episodic
+python scripts/run_sweep.py --size-filter small --conditions amnesiac,recall
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def sweep(
     summary_methods: Annotated[
         str,
         typer.Option("--summary-methods", help="Comma-separated summarizer methods."),
-    ] = "structured",
+    ] = "lexical",
     n: Annotated[
         int | None,
         typer.Option("--n", help="Limit sessions per condition (default: all 500)."),
@@ -462,7 +462,7 @@ def _preflight_check_summaries(
                 f"  First missing: {missing[0]['session_id']}\n"
                 f"  Expected:      {Path(missing[0]['summaries_dir']) / f'{method}.jsonl'}\n"
                 f"  Fix: python scripts/summarize.py --method {method}"
-                + (f" --provider hf:<model>" if method != "structured" else ""),
+                + (f" --provider hf:<model>" if method != "lexical" else ""),
                 err=True,
             )
         else:

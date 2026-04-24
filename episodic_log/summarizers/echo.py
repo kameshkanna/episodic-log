@@ -1,4 +1,4 @@
-"""Self summarizer — agent model writes its own memory log entries.
+"""Echo summarizer — agent model writes its own memory log entries.
 
 Uses the same agent model (via any :class:`~episodic_log.providers.base.BaseProvider`
 implementation) to write 1-2 sentence summaries of
@@ -45,7 +45,7 @@ _TEMPERATURE = 0.0
 _MAX_CONTENT_CHARS = 1500
 
 
-class SelfSummarizer(AbstractSummarizer):
+class EchoSummarizer(AbstractSummarizer):
     """Agent model writes its own memory log entries.
 
     Uses the agent's own model (provided via *provider*) to produce memory
@@ -70,8 +70,8 @@ class SelfSummarizer(AbstractSummarizer):
 
     @property
     def method(self) -> str:
-        """Return the method identifier ``"self"``."""
-        return "self"
+        """Return the method identifier ``"echo"``."""
+        return "echo"
 
     def summarize(self, event: TurnEvent) -> TurnSummary:
         """Generate a 1-2 sentence self-authored summary of *event*.
@@ -97,7 +97,7 @@ class SelfSummarizer(AbstractSummarizer):
         user_message = _format_prompt(event)
 
         logger.debug(
-            "SelfSummarizer: calling provider for session=%s turn=%s",
+            "EchoSummarizer: calling provider for session=%s turn=%s",
             event.session_id,
             event.turn_id,
         )
@@ -111,7 +111,7 @@ class SelfSummarizer(AbstractSummarizer):
 
         summary = raw_summary.strip()
         logger.debug(
-            "SelfSummarizer: session=%s turn=%s summary_len=%d",
+            "EchoSummarizer: session=%s turn=%s summary_len=%d",
             event.session_id,
             event.turn_id,
             len(summary),
@@ -133,7 +133,7 @@ class SelfSummarizer(AbstractSummarizer):
 
         Args:
             events: All events to summarise.
-            batch_size: Turns per ``generate_batch`` call (default 32).
+            batch_size: Turns per ``generate_batch`` call (default 8).
 
         Returns:
             List of :class:`TurnSummary` objects in the same order as *events*.
@@ -169,7 +169,7 @@ class SelfSummarizer(AbstractSummarizer):
 
 
 def _format_prompt(event: TurnEvent) -> str:
-    """Format the user-turn prompt for the self summarizer.
+    """Format the user-turn prompt for the echo summarizer.
 
     Args:
         event: The event whose fields are embedded in the prompt.

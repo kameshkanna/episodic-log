@@ -2,21 +2,21 @@
 
 Usage
 -----
-# Baseline — 5 sessions, local 8B model
-python scripts/evaluate.py --condition baseline --n 5 \
+# Amnesiac — 5 sessions, local 8B model
+python scripts/evaluate.py --condition amnesiac --n 5 \
     --provider hf:meta-llama/Llama-3.1-8B-Instruct
 
-# Episodic + 72B 4-bit, structured summaries
-python scripts/evaluate.py --condition episodic --summary-method structured \
+# Recall + 72B 4-bit, lexical summaries
+python scripts/evaluate.py --condition recall --summary-method lexical \
     --provider hf:Qwen/Qwen2.5-72B-Instruct:4bit
 
 # All sessions with Groq + CHD judge
-python scripts/evaluate.py --condition episodic \
+python scripts/evaluate.py --condition recall \
     --provider groq:llama-3.3-70b-versatile \
     --judge --judge-provider groq:llama-3.1-70b-versatile
 
 # Explicit model slug (overrides auto-derived name in output path)
-python scripts/evaluate.py --condition baseline \
+python scripts/evaluate.py --condition amnesiac \
     --provider hf:Qwen/Qwen2.5-7B-Instruct \
     --model-slug qwen-2.5-7b
 """
@@ -58,7 +58,7 @@ def evaluate(
             help=f"Condition name: {', '.join(ALL_CONDITIONS)}.",
             case_sensitive=False,
         ),
-    ] = "baseline",
+    ] = "amnesiac",
     provider_spec: Annotated[
         str,
         typer.Option("--provider", help="Provider spec (e.g. groq:llama-3.1-8b-instant)."),
@@ -66,7 +66,7 @@ def evaluate(
     summary_method: Annotated[
         str,
         typer.Option("--summary-method", help="Summary method for retrieval conditions."),
-    ] = "structured",
+    ] = "lexical",
     n: Annotated[
         int | None,
         typer.Option("--n", help="Limit to first N sessions (default: all)."),

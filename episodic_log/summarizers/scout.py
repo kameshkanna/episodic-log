@@ -1,4 +1,4 @@
-"""Haiku LLM-based summarizer.
+"""Scout LLM-based summarizer.
 
 Uses a small language model (via any :class:`~episodic_log.providers.base.BaseProvider`
 implementation) to write 1-2 sentence summaries of
@@ -44,7 +44,7 @@ _TEMPERATURE = 0.0
 _MAX_CONTENT_CHARS = 1500
 
 
-class HaikuSummarizer(AbstractSummarizer):
+class ScoutSummarizer(AbstractSummarizer):
     """LLM-based summarizer intended for a small, fast inference model.
 
     Calls the provided :class:`~episodic_log.providers.base.BaseProvider` once
@@ -52,7 +52,7 @@ class HaikuSummarizer(AbstractSummarizer):
     1-2 sentence summary that preserves all technical identifiers verbatim.
 
     This summarizer introduces a *low contamination risk* relative to
-    :class:`~episodic_log.summarizers.self_summarizer.SelfSummarizer` because
+    :class:`~episodic_log.summarizers.echo.EchoSummarizer` because
     it uses a separate, smaller model rather than the agent model itself.
 
     Args:
@@ -70,8 +70,8 @@ class HaikuSummarizer(AbstractSummarizer):
 
     @property
     def method(self) -> str:
-        """Return the method identifier ``"haiku"``."""
-        return "haiku"
+        """Return the method identifier ``"scout"``."""
+        return "scout"
 
     def summarize(self, event: TurnEvent) -> TurnSummary:
         """Generate a 1-2 sentence LLM summary of *event*.
@@ -97,7 +97,7 @@ class HaikuSummarizer(AbstractSummarizer):
         user_message = _format_prompt(event)
 
         logger.debug(
-            "HaikuSummarizer: calling provider for session=%s turn=%s",
+            "ScoutSummarizer: calling provider for session=%s turn=%s",
             event.session_id,
             event.turn_id,
         )
@@ -111,7 +111,7 @@ class HaikuSummarizer(AbstractSummarizer):
 
         summary = raw_summary.strip()
         logger.debug(
-            "HaikuSummarizer: session=%s turn=%s summary_len=%d",
+            "ScoutSummarizer: session=%s turn=%s summary_len=%d",
             event.session_id,
             event.turn_id,
             len(summary),
@@ -175,7 +175,7 @@ class HaikuSummarizer(AbstractSummarizer):
 
 
 def _format_prompt(event: TurnEvent) -> str:
-    """Format the user-turn prompt for the haiku summarizer.
+    """Format the user-turn prompt for the scout summarizer.
 
     Args:
         event: The event whose fields are embedded in the prompt.
