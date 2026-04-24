@@ -1,21 +1,20 @@
-"""Multi-model sweep — runs all conditions across a configurable model matrix.
+"""Multi-model sweep — queue-based GPU scheduler.
 
-Loads each model once per GPU worker, evaluates all assigned conditions, then
-explicitly unloads it before loading the next model.  With --num-gpus > 1 the
-matrix is distributed across workers so multiple models run simultaneously.
+Each model runs on exactly one GPU.  All 9 models fit on a single A100 80 GB
+(largest is 72B at 4-bit ≈ 36 GB).  With 8 GPUs the first 8 models start
+immediately and the 9th slots in as soon as the fastest GPU finishes.
 
-Results (predictions only, no verdicts) are written to:
+No phases.  No idle GPUs.  No spreading one model across all 8 cards.
+
+Results are written to:
     ``data/results/<model-slug>/<condition>__<method>.jsonl``
 
-Run judge.py separately after the sweep to fill in verdicts using local HF
-models across all GPUs — no API calls, no rate limits.
-
-Recommended workflow (8x A100)
---------------------------------
-# Step 1 — Inference sweep (all 8 GPUs in parallel)
+Recommended workflow (8× A100 80 GB)
+--------------------------------------
+# Step 1 — Full sweep (all 9 models × 7 conditions × 3 methods)
 python scripts/run_sweep.py --summary-methods structured,haiku,self
 
-# Step 2 — Local HF judge across all 8 GPUs
+# Step 2 — Local HF judge (8 GPUs in parallel, no API rate limits)
 python scripts/judge.py --judge-provider hf:Qwen/Qwen2.5-14B-Instruct
 
 # Step 3 — Score
@@ -23,17 +22,9 @@ python scripts/score.py --breakdown
 
 Other examples
 --------------
-# Dry-run: see planned runs without executing
 python scripts/run_sweep.py --dry-run
-
-# Small models only, two conditions
 python scripts/run_sweep.py --size-filter small --conditions baseline,episodic
-
-# Single model, explicit GPU
 python scripts/run_sweep.py --model hf:Qwen/Qwen2.5-7B-Instruct --num-gpus 1
-
-# Override GPU count
-python scripts/run_sweep.py --num-gpus 4
 """
 
 from __future__ import annotations
@@ -44,7 +35,8 @@ import logging
 import multiprocessing as mp
 import os
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
@@ -63,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model matrix  (tuned for 8× A100 80 GB SXM4)
+# Model matrix  (8× A100 80 GB SXM4 — all models fit on a single card)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -74,32 +66,30 @@ class ModelSpec:
         spec: Provider spec string (e.g. ``hf:org/model:4bit``).
         slug: Filesystem-safe short identifier.
         size: ``"small"`` | ``"medium"`` | ``"large"``.
-        family: Model family (``"llama"`` | ``"qwen"`` | ``"gemma"`` | ``"mistral"``).
-        device_map: HuggingFace device_map value.  ``"cuda:0"`` for models that
-            fit on one GPU; ``"auto"`` for large models that should span all
-            available GPUs for maximum throughput.
+        family: Model family.
+        vram_gb: Approximate VRAM required (informational, used in dry-run).
     """
 
     spec: str
     slug: str
     size: str
     family: str
-    device_map: str = "cuda:0"
+    vram_gb: int = 0
 
 
 MODEL_MATRIX: list[ModelSpec] = [
-    # --- Small (7–9B, BF16, ~14–18 GB) — one GPU each, run 8 in parallel ---
-    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",        "llama-3.1-8b",       "small",  "llama", "cuda:0"),
-    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",                "qwen-2.5-7b",        "small",  "qwen",  "cuda:0"),
-    ModelSpec("hf:google/gemma-2-9b-it",                     "gemma-2-9b",         "small",  "gemma", "cuda:0"),
-    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",       "mistral-7b",         "small",  "mistral","cuda:0"),
-    # --- Medium (14–27B, BF16, ~28–54 GB) — one GPU each, run 8 in parallel ---
-    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",               "qwen-2.5-14b",       "medium", "qwen",  "cuda:0"),
-    ModelSpec("hf:google/gemma-2-27b-it",                    "gemma-2-27b",        "medium", "gemma", "cuda:0"),
-    # --- Large (32–72B, 4-bit) — device_map="auto" spans all GPUs for peak throughput ---
-    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct:4bit",          "qwen-2.5-32b-4bit",  "large",  "qwen",  "auto"),
-    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct:4bit",  "llama-3.3-70b-4bit", "large",  "llama", "auto"),
-    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct:4bit",          "qwen-2.5-72b-4bit",  "large",  "qwen",  "auto"),
+    # --- Small (7–9B BF16, ~14–18 GB) ---
+    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",        "llama-3.1-8b",       "small",  "llama",   16),
+    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",                "qwen-2.5-7b",        "small",  "qwen",    14),
+    ModelSpec("hf:google/gemma-2-9b-it",                     "gemma-2-9b",         "small",  "gemma",   18),
+    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",       "mistral-7b",         "small",  "mistral", 14),
+    # --- Medium (14–27B BF16, ~28–54 GB — all fit in 80 GB) ---
+    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",               "qwen-2.5-14b",       "medium", "qwen",    28),
+    ModelSpec("hf:google/gemma-2-27b-it",                    "gemma-2-27b",        "medium", "gemma",   54),
+    # --- Large (32–72B 4-bit, ~16–36 GB — all fit in 80 GB) ---
+    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct:4bit",          "qwen-2.5-32b-4bit",  "large",  "qwen",    16),
+    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct:4bit",  "llama-3.3-70b-4bit", "large",  "llama",   35),
+    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct:4bit",          "qwen-2.5-72b-4bit",  "large",  "qwen",    36),
 ]
 
 _SIZE_LABELS = {"small", "medium", "large"}
@@ -110,7 +100,7 @@ _SIZE_LABELS = {"small", "medium", "large"}
 
 app = typer.Typer(
     name="run-sweep",
-    help="Multi-model sweep across conditions and summarizer methods.",
+    help="Queue-based multi-GPU CHD evaluation sweep.",
     add_completion=False,
 )
 
@@ -131,13 +121,13 @@ def sweep(
     ] = None,
     family_filter: Annotated[
         str | None,
-        typer.Option("--family-filter", help="Only run models from this family (llama|qwen|gemma|mistral)."),
+        typer.Option("--family-filter", help="Only run models from this family."),
     ] = None,
     conditions: Annotated[
         str,
         typer.Option(
             "--conditions",
-            help=f"Comma-separated conditions to run (default: all). Options: {','.join(ALL_CONDITIONS)}",
+            help=f"Comma-separated conditions (default: all). Options: {','.join(ALL_CONDITIONS)}",
         ),
     ] = ",".join(ALL_CONDITIONS),
     summary_methods: Annotated[
@@ -158,10 +148,7 @@ def sweep(
     ] = Path("data/results"),
     num_gpus: Annotated[
         int | None,
-        typer.Option(
-            "--num-gpus",
-            help="Number of GPUs to use in parallel (default: all available).",
-        ),
+        typer.Option("--num-gpus", help="GPU slots (default: all available via torch.cuda.device_count())."),
     ] = None,
     overwrite: Annotated[
         bool,
@@ -169,13 +156,13 @@ def sweep(
     ] = False,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the planned runs without executing any."),
+        typer.Option("--dry-run", help="Print the planned queue without executing."),
     ] = False,
 ) -> None:
-    """Execute the full multi-model CHD evaluation sweep."""
+    """Run all models through the CHD evaluation sweep using a GPU queue."""
     # ── Parse inputs ──────────────────────────────────────────────────────
     condition_list = [c.strip() for c in conditions.split(",") if c.strip()]
-    method_list = [m.strip() for m in summary_methods.split(",") if m.strip()]
+    method_list    = [m.strip() for m in summary_methods.split(",") if m.strip()]
 
     for c in condition_list:
         if c not in ALL_CONDITIONS:
@@ -216,104 +203,111 @@ def sweep(
             num_gpus = max(1, torch.cuda.device_count())
         except ImportError:
             num_gpus = 1
-    typer.echo(f"GPUs to use: {num_gpus}")
 
-    # ── Plan runs ────────────────────────────────────────────────────────
-    runs: list[tuple[ModelSpec, str, str]] = []
-    for m in matrix:
-        for cond in condition_list:
-            for method in method_list:
-                runs.append((m, cond, method))
+    total_runs = len(matrix) * len(condition_list) * len(method_list)
+    typer.echo(f"\n{'DRY RUN — ' if dry_run else ''}Queue: {len(matrix)} model(s)  "
+               f"{len(condition_list)} condition(s)  {len(method_list)} method(s)  "
+               f"= {total_runs} result files  |  GPU slots: {num_gpus}\n")
 
-    assignments = _distribute_models([m for m in matrix if m.device_map != "auto"], num_gpus)
-    typer.echo(f"\n{'DRY RUN — ' if dry_run else ''}Planned {len(runs)} run(s):\n")
-    typer.echo("  Phase 1 — parallel (one GPU each):")
-    for gpu_id, specs in assignments.items():
-        for m in specs:
-            typer.echo(f"    GPU {gpu_id}  {m.slug:<28} [{m.size}]")
-    multi_gpu = [m for m in matrix if m.device_map == "auto"]
-    if multi_gpu:
-        typer.echo("  Phase 2 — sequential (all GPUs via device_map=auto):")
-        for m in multi_gpu:
-            typer.echo(f"    ALL GPUs  {m.slug:<28} [{m.size}]")
-    typer.echo("")
-    for m, cond, method in runs:
-        out = output_dir / m.slug / f"{cond}__{method}.jsonl"
-        status = "[SKIP existing]" if (out.exists() and not overwrite) else ""
-        typer.echo(f"  {m.slug:<28} {cond:<16} {method:<12} {status}")
+    for i, m in enumerate(matrix):
+        slot = i if i < num_gpus else f"queued (slot free after GPU {i % num_gpus})"
+        typer.echo(f"  [{i:>2}] {m.slug:<28} ~{m.vram_gb:>2} GB  →  GPU slot {slot}")
 
     if dry_run:
         return
 
-    # ── Two-phase execution ───────────────────────────────────────────────
-    # Phase 1: small/medium models — one GPU each, run in parallel.
-    # Phase 2: large models with device_map="auto" — use all GPUs, sequential.
-    single_gpu_models = [m for m in matrix if m.device_map != "auto"]
-    multi_gpu_models  = [m for m in matrix if m.device_map == "auto"]
-
-    if single_gpu_models:
-        typer.echo(f"\n── Phase 1: {len(single_gpu_models)} model(s) across {num_gpus} GPU(s) in parallel")
-        phase_assignments = _distribute_models(single_gpu_models, num_gpus)
-        if num_gpus == 1:
-            _gpu_worker(
-                gpu_id=0,
-                assigned_models=single_gpu_models,
-                condition_list=condition_list,
-                method_list=method_list,
-                sessions_meta=sessions_meta,
-                output_dir=output_dir,
-                overwrite=overwrite,
-            )
-        else:
-            ctx = mp.get_context("spawn")
-            processes: list[mp.Process] = []
-            for gpu_id, assigned_models in phase_assignments.items():
-                if not assigned_models:
-                    continue
-                p = ctx.Process(
-                    target=_gpu_worker,
-                    args=(gpu_id, assigned_models, condition_list, method_list,
-                          sessions_meta, output_dir, overwrite),
-                    name=f"sweep-gpu{gpu_id}",
-                )
-                p.start()
-                processes.append(p)
-                typer.echo(f"  Launched GPU {gpu_id} — {[m.slug for m in assigned_models]}")
-            for p in processes:
-                p.join()
-                if p.exitcode != 0:
-                    logger.error("Worker %s exited with code %d", p.name, p.exitcode)
-
-    if multi_gpu_models:
-        typer.echo(f"\n── Phase 2: {len(multi_gpu_models)} large model(s) with device_map=auto (all GPUs)")
-        for model_spec in multi_gpu_models:
-            typer.echo(f"\n{'='*60}")
-            typer.echo(f"Loading {model_spec.spec}  [{model_spec.size}]  device_map=auto")
-            typer.echo(f"{'='*60}")
-            try:
-                provider = _load_provider(model_spec.spec, device_map="auto")
-            except Exception as exc:
-                logger.error("Failed to load %s: %s", model_spec.spec, exc, exc_info=True)
-                continue
-            for cond_name in condition_list:
-                for method in method_list:
-                    out_path = output_dir / model_spec.slug / f"{cond_name}__{method}.jsonl"
-                    if out_path.exists() and not overwrite:
-                        typer.echo(f"  Skipping {cond_name}/{method} — exists")
-                        continue
-                    typer.echo(f"  Running {cond_name}/{method}")
-                    _run_condition(
-                        provider=provider,
-                        condition_name=cond_name,
-                        summary_method=method,
-                        sessions_meta=sessions_meta,
-                        output_path=out_path,
-                        model_slug=model_spec.slug,
-                    )
-            _unload_provider(provider)
-            del provider
+    # ── Run queue ────────────────────────────────────────────────────────
+    _run_gpu_queue(
+        matrix=matrix,
+        num_gpus=num_gpus,
+        condition_list=condition_list,
+        method_list=method_list,
+        sessions_meta=sessions_meta,
+        output_dir=output_dir,
+        overwrite=overwrite,
+    )
 
     typer.echo("\nSweep complete. Run judge.py then score.py.")
+
+
+# ---------------------------------------------------------------------------
+# Queue scheduler
+# ---------------------------------------------------------------------------
+
+def _run_gpu_queue(
+    matrix: list[ModelSpec],
+    num_gpus: int,
+    condition_list: list[str],
+    method_list: list[str],
+    sessions_meta: list[dict],
+    output_dir: Path,
+    overwrite: bool,
+    poll_interval: float = 5.0,
+) -> None:
+    """Queue-based GPU scheduler.
+
+    Maintains up to *num_gpus* concurrent worker processes.  As soon as a GPU
+    slot is freed the next model in the queue starts on it immediately —
+    no idle GPUs, no waiting for slow models to synchronise.
+
+    Args:
+        matrix: Ordered list of models to evaluate.
+        num_gpus: Maximum concurrent worker processes.
+        condition_list: Conditions to evaluate per model.
+        method_list: Summarizer methods to evaluate per model.
+        sessions_meta: Pre-loaded session index.
+        output_dir: Root results directory.
+        overwrite: Whether to overwrite existing result files.
+        poll_interval: Seconds between liveness checks on running workers.
+    """
+    if num_gpus == 1:
+        # Single-GPU path — no subprocess overhead.
+        _gpu_worker(
+            gpu_id=0,
+            assigned_models=matrix,
+            condition_list=condition_list,
+            method_list=method_list,
+            sessions_meta=sessions_meta,
+            output_dir=output_dir,
+            overwrite=overwrite,
+        )
+        return
+
+    ctx = mp.get_context("spawn")
+    model_queue: list[ModelSpec] = list(matrix)
+    free_gpus: list[int]         = list(range(num_gpus))
+    running: dict[int, tuple[mp.Process, ModelSpec]] = {}  # gpu_id → (process, spec)
+
+    while model_queue or running:
+        # Fill every free GPU slot.
+        while model_queue and free_gpus:
+            gpu_id     = free_gpus.pop(0)
+            model_spec = model_queue.pop(0)
+            p = ctx.Process(
+                target=_gpu_worker,
+                args=(gpu_id, [model_spec], condition_list, method_list,
+                      sessions_meta, output_dir, overwrite),
+                name=f"sweep-{model_spec.slug}",
+            )
+            p.start()
+            running[gpu_id] = (p, model_spec)
+            logger.info(
+                "GPU %d: started %-28s  [%d queued / %d running]",
+                gpu_id, model_spec.slug, len(model_queue), len(running),
+            )
+
+        # Poll until at least one worker finishes.
+        time.sleep(poll_interval)
+        for gpu_id in list(running):
+            p, spec = running[gpu_id]
+            if not p.is_alive():
+                p.join()
+                if p.exitcode != 0:
+                    logger.error("GPU %d (%s) exited with code %d", gpu_id, spec.slug, p.exitcode)
+                else:
+                    logger.info("GPU %d: finished %s", gpu_id, spec.slug)
+                del running[gpu_id]
+                free_gpus.append(gpu_id)
 
 
 # ---------------------------------------------------------------------------
@@ -329,22 +323,22 @@ def _gpu_worker(
     output_dir: Path,
     overwrite: bool,
 ) -> None:
-    """Load and evaluate each assigned model sequentially on a single GPU.
+    """Evaluate assigned models sequentially on one GPU.
 
-    Intended to run as a child process via ``multiprocessing.spawn``.
-    Sets ``CUDA_VISIBLE_DEVICES`` so the process owns exactly one GPU.
+    Called as a subprocess by :func:`_run_gpu_queue`.  Binds the process to
+    a single GPU via ``CUDA_VISIBLE_DEVICES`` so models never spill over to
+    neighbouring cards.
 
     Args:
         gpu_id: Physical GPU index to bind to.
-        assigned_models: Models this worker is responsible for.
-        condition_list: Condition names to evaluate.
-        method_list: Summarizer methods to evaluate.
+        assigned_models: Models this worker evaluates in order.
+        condition_list: Conditions to run for each model.
+        method_list: Summarizer methods to run for each model.
         sessions_meta: Pre-loaded session index records.
         output_dir: Root results directory.
         overwrite: Whether to overwrite existing result files.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s %(levelname)s [GPU{gpu_id}] %(name)s: %(message)s",
@@ -352,9 +346,9 @@ def _gpu_worker(
     worker_logger = logging.getLogger(__name__)
 
     for model_spec in assigned_models:
-        worker_logger.info("Loading %s  device_map=%s", model_spec.spec, model_spec.device_map)
+        worker_logger.info("Loading %s", model_spec.spec)
         try:
-            provider = _load_provider(model_spec.spec, device_map=model_spec.device_map)
+            provider = _load_provider(model_spec.spec, device_map="cuda:0")
         except Exception as exc:
             worker_logger.error("Failed to load %s: %s", model_spec.spec, exc, exc_info=True)
             continue
@@ -384,23 +378,7 @@ def _gpu_worker(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _distribute_models(matrix: list[ModelSpec], num_gpus: int) -> dict[int, list[ModelSpec]]:
-    """Assign models to GPUs round-robin by index.
-
-    Args:
-        matrix: Full list of models to distribute.
-        num_gpus: Number of available GPUs.
-
-    Returns:
-        Dict mapping GPU index → list of assigned ModelSpecs.
-    """
-    assignments: dict[int, list[ModelSpec]] = {i: [] for i in range(num_gpus)}
-    for idx, model_spec in enumerate(matrix):
-        assignments[idx % num_gpus].append(model_spec)
-    return assignments
-
-
-def _load_provider(spec: str, device_map: str = "auto"):
+def _load_provider(spec: str, device_map: str = "cuda:0"):
     from episodic_log.providers import get_provider
     return get_provider(spec, device_map=device_map)
 
@@ -436,7 +414,6 @@ def _run_condition(
         desc=f"{model_slug[:18]}/{condition_name}/{summary_method}",
         unit="session",
         dynamic_ncols=True,
-        position=0,
         leave=True,
     )
     with output_path.open("w", encoding="utf-8") as fh:
