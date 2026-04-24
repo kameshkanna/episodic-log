@@ -61,13 +61,14 @@ class LogReader:
         """Load :class:`~episodic_log.core.turn_event.TurnEvent` records matching the given turn_id strings.
 
         Args:
-            turn_ids: List of zero-padded turn_id strings to retrieve.
+            turn_ids: Ordered list of zero-padded turn_id strings to retrieve.
 
         Returns:
-            Events whose turn_id appears in *turn_ids*, in log order.
+            Events in the same order as *turn_ids*, preserving BM25 relevance ranking.
+            Turn IDs not found in the log are silently skipped.
         """
-        id_set: set[str] = set(turn_ids)
-        return [e for e in self.load_all() if e.turn_id in id_set]
+        event_map: dict[str, TurnEvent] = {e.turn_id: e for e in self.load_all()}
+        return [event_map[tid] for tid in turn_ids if tid in event_map]
 
     def count(self) -> int:
         """Return the total number of non-empty lines in the log.
