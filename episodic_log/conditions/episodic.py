@@ -7,7 +7,7 @@ import logging
 import re
 
 from episodic_log.conditions.base import BaseCondition, ConditionResult
-from episodic_log.core.log_reader import LogReader, TurnLoader
+from episodic_log.core.log_reader import LogReader, TurnLoader, _format_event
 from episodic_log.ingestor.longmemeval import IngestedSession
 from episodic_log.providers.base import BaseProvider
 from episodic_log.retrieval.summary_store import SummaryStore
@@ -66,7 +66,6 @@ class EpisodicCondition(BaseCondition):
         """
         store = SummaryStore(session.summaries_dir)
         reader = LogReader(session.log_path)
-        loader = TurnLoader(reader)
 
         messages: list[str] = [question]
         all_retrieved: list[str] = []
@@ -93,7 +92,7 @@ class EpisodicCondition(BaseCondition):
                 turn_ids = self._retrieve(store, query)
                 all_retrieved.extend(turn_ids)
                 retrieval_calls += 1
-                context = loader.load_and_format(turn_ids)
+                context = self._format_context(turn_ids, reader)
                 tool_result = (
                     f"[read_summaries result]\n{context}\n[/read_summaries]"
                     if context
@@ -116,6 +115,22 @@ class EpisodicCondition(BaseCondition):
             retrieved_turn_ids=list(dict.fromkeys(all_retrieved)),
             num_retrieval_calls=retrieval_calls,
         )
+
+    def _format_context(self, turn_ids: list[str], reader: LogReader) -> str:
+        """Format retrieved turn events into a context string for the prompt.
+
+        Subclasses may override this to decorate turn blocks (e.g. adding
+        provenance headers) without duplicating the retrieval loop.
+
+        Args:
+            turn_ids: Ordered list of turn IDs to load and format.
+            reader: :class:`~episodic_log.core.log_reader.LogReader` for the session.
+
+        Returns:
+            Formatted context string ready for prompt injection.
+        """
+        loader = TurnLoader(reader)
+        return loader.load_and_format(turn_ids)
 
     def _retrieve(self, store: SummaryStore, query: str) -> list[str]:
         """Run a BM25 query and return turn_ids.  Override in subclasses.

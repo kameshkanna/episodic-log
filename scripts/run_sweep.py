@@ -285,9 +285,7 @@ def _unload_provider(provider) -> None:
     """Release GPU memory held by a HuggingFace provider."""
     try:
         import torch
-        model_attr = getattr(provider, "_model", None)
-        if model_attr is not None:
-            del model_attr
+        if getattr(provider, "_model", None) is not None:
             provider._model = None  # type: ignore[attr-defined]
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

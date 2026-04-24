@@ -110,8 +110,6 @@ class GroqProvider(BaseProvider):
                 logger.error("GroqProvider: API error: %s", exc)
                 raise RuntimeError(f"GroqProvider: API error: {exc}") from exc
 
-        raise RuntimeError(f"GroqProvider: all {_MAX_RETRIES} retry attempts exhausted.")
-
 
 def _parse_retry_after(exc: Any) -> float | None:
     """Extract the Retry-After header value from a RateLimitError if present.
