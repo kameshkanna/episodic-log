@@ -1,8 +1,8 @@
 """LongMemEval dataset ingestor.
 
-Converts HuggingFace ``xiaowu0162/LongMemEval`` instances into immutable
-:class:`~episodic_log.core.turn_event.TurnEvent` records persisted to
-``<data_dir>/<session_id>/log.jsonl``.
+Converts HuggingFace ``xiaowu0162/longmemeval-cleaned`` instances into
+immutable :class:`~episodic_log.core.turn_event.TurnEvent` records persisted
+to ``<data_dir>/<session_id>/log.jsonl``.
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ _SYNTHETIC_EPOCH = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 _TURN_ID_WIDTH = 4
 
 # HuggingFace dataset coordinates.
-_HF_DATASET_NAME = "xiaowu0162/LongMemEval"
-_HF_DATASET_CONFIG = "default"
+_HF_DATASET_NAME = "xiaowu0162/longmemeval-cleaned"
 _HF_DATASET_SPLIT = "test"
 
 
@@ -63,7 +62,7 @@ class IngestedSession:
 
 
 class LongMemEvalIngestor:
-    """Converts LongMemEval dataset instances into our TurnEvent log format.
+    """Converts ``xiaowu0162/longmemeval-cleaned`` instances into our TurnEvent log format.
 
     Each ``session_history`` turn becomes a :class:`~episodic_log.core.turn_event.TurnEvent` with:
 
@@ -202,7 +201,7 @@ class LongMemEvalIngestor:
     def load_dataset(n: int | None = None, seed: int = 42) -> list[dict[str, Any]]:
         """Load LongMemEval from HuggingFace ``datasets``.
 
-        Dataset: ``xiaowu0162/LongMemEval``, config: ``default``, split: ``test``.
+        Dataset: ``xiaowu0162/longmemeval-cleaned``, split: ``test``.
         The dataset is shuffled with *seed* for reproducibility; when *n* is
         provided only the first *n* instances after shuffling are returned.
 
@@ -230,17 +229,11 @@ class LongMemEvalIngestor:
             ) from exc
 
         logger.info(
-            "Loading %s (config=%s, split=%s) from HuggingFace…",
+            "Loading %s (split=%s) from HuggingFace…",
             _HF_DATASET_NAME,
-            _HF_DATASET_CONFIG,
             _HF_DATASET_SPLIT,
         )
-        ds = load_dataset(
-            _HF_DATASET_NAME,
-            _HF_DATASET_CONFIG,
-            split=_HF_DATASET_SPLIT,
-            trust_remote_code=True,
-        )
+        ds = load_dataset(_HF_DATASET_NAME, split=_HF_DATASET_SPLIT)
         ds = ds.shuffle(seed=seed)
         if n is not None:
             ds = ds.select(range(n))
