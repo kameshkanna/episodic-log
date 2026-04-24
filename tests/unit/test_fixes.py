@@ -146,7 +146,94 @@ def test_summarize_keeps_partial_file_on_some_failures(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. run_sweep._preflight_check_summaries
+# 2a. run_sweep._adapt_matrix — hardware-aware model resolution
+# ---------------------------------------------------------------------------
+
+def test_adapt_matrix_bf16_fits_single_gpu() -> None:
+    """Small models whose BF16 footprint <= usable VRAM get num_gpus_needed=1, no quant."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    # 80 GB GPU — everything should fit BF16 on 1 GPU except 70B/72B
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=80.0, num_gpus=1,
+                            size_filter="small")
+    assert len(matrix) == 4
+    for m in matrix:
+        assert m.num_gpus_needed == 1
+        assert ":4bit" not in m.spec, f"Small model {m.slug} should be BF16 on 80GB GPU"
+
+
+def test_adapt_matrix_falls_back_to_4bit_on_small_gpu() -> None:
+    """Large models that don't fit BF16 get resolved to 4-bit."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    # Single 24 GB GPU (like an RTX 3090)
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=24.0, num_gpus=1)
+    slugs = {m.slug: m for m in matrix}
+
+    # 32B BF16 = 64GB doesn't fit; 4-bit = 20GB fits
+    assert "qwen-2.5-32b-4bit" in slugs
+    assert slugs["qwen-2.5-32b-4bit"].num_gpus_needed == 1
+
+    # 70B BF16 = 140GB, 4-bit = 38GB — doesn't fit single 24GB
+    assert "llama-3.3-70b-4bit" not in slugs
+    assert "llama-3.3-70b" not in slugs
+
+
+def test_adapt_matrix_multi_gpu_bf16() -> None:
+    """70B/72B BF16 uses 2 GPUs on an 8× 80 GB server, not 4-bit."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=80.0, num_gpus=8)
+    slugs = {m.slug: m for m in matrix}
+
+    # 140GB / (80*0.88=70.4GB) = ceil(1.99) = 2 GPUs for llama-3.3-70b BF16
+    assert "llama-3.3-70b" in slugs
+    assert slugs["llama-3.3-70b"].num_gpus_needed == 2
+    assert ":4bit" not in slugs["llama-3.3-70b"].spec
+
+
+def test_adapt_matrix_skips_models_that_dont_fit() -> None:
+    """Models too large for any available config are dropped."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    # 8 GB VRAM (e.g. a consumer GPU) — only tiny 4-bit models fit
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=8.0, num_gpus=1)
+    for m in matrix:
+        assert m.vram_gb <= 8 * 0.88 + 1  # allow small rounding
+
+
+def test_adapt_matrix_size_filter() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=80.0, num_gpus=8,
+                            size_filter="medium")
+    assert all(m.size == "medium" for m in matrix)
+    assert len(matrix) == 2
+
+
+def test_adapt_matrix_family_filter() -> None:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.run_sweep import _adapt_matrix, MODEL_CATALOGUE
+
+    matrix = _adapt_matrix(MODEL_CATALOGUE, vram_per_gpu=80.0, num_gpus=8,
+                            family_filter="qwen")
+    assert all(m.family == "qwen" for m in matrix)
+    assert len(matrix) >= 3  # 7b, 14b, 32b, 72b
+
+
+# ---------------------------------------------------------------------------
+# 2b. run_sweep._preflight_check_summaries
 # ---------------------------------------------------------------------------
 
 def test_preflight_passes_when_all_files_exist(tmp_path: Path) -> None:
