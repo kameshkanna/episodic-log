@@ -1,23 +1,34 @@
 """Multi-model sweep — runs all conditions across a configurable model matrix.
 
 Loads each model once, evaluates all requested conditions, then explicitly
-unloads it before loading the next model.  Results are written to
-``data/results/<model-slug>/<condition>__<method>.jsonl``.
+unloads it and clears GPU memory before loading the next model.  Results
+(predictions only, no verdicts) are written to:
+    ``data/results/<model-slug>/<condition>__<method>.jsonl``
 
-Usage
------
-# Dry-run: list what would run, no inference
+Run judge.py separately after the sweep to fill in verdicts in parallel
+using batched Groq requests — much faster than inline per-row judging.
+
+Recommended workflow
+--------------------
+# Step 1 — Inference sweep (GPU)
+python scripts/run_sweep.py --conditions baseline,episodic --size-filter small
+
+# Step 2 — Batch judge all results (Groq, parallel, fast)
+python scripts/judge.py --judge-provider groq:llama-3.1-70b-versatile
+
+# Step 3 — Score
+python scripts/score.py
+
+Other examples
+--------------
+# Dry-run: see planned runs without executing
 python scripts/run_sweep.py --dry-run
 
-# Full sweep — all models × all conditions
-python scripts/run_sweep.py \
-    --judge-provider groq:llama-3.1-70b-versatile
+# Full sweep — all 9 models × all 7 conditions
+python scripts/run_sweep.py
 
-# Only small models (7–9B), specific conditions
-python scripts/run_sweep.py \
-    --size-filter small \
-    --conditions baseline,episodic \
-    --n 50
+# Only Qwen family
+python scripts/run_sweep.py --family-filter qwen --conditions baseline,episodic
 
 # Single model
 python scripts/run_sweep.py \
@@ -137,11 +148,17 @@ def sweep(
     ] = Path("data/results"),
     judge: Annotated[
         bool,
-        typer.Option("--judge/--no-judge", help="Run CHD judge on each prediction."),
-    ] = True,
+        typer.Option(
+            "--judge/--no-judge",
+            help=(
+                "Inline CHD judging after each condition. "
+                "Prefer running scripts/judge.py separately for batched parallel judging."
+            ),
+        ),
+    ] = False,
     judge_provider_spec: Annotated[
         str,
-        typer.Option("--judge-provider", help="Provider spec for CHD judge."),
+        typer.Option("--judge-provider", help="Provider spec for inline CHD judge (only used with --judge)."),
     ] = "groq:llama-3.1-70b-versatile",
     overwrite: Annotated[
         bool,

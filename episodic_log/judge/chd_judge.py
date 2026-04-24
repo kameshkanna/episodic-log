@@ -119,14 +119,20 @@ class CHDJudge:
     def judge_batch(
         self,
         inputs: list[dict[str, Any]],
+        max_workers: int = 8,
     ) -> list[JudgeVerdict]:
-        """Judge a batch of predictions.
+        """Judge a batch of predictions with concurrent Groq requests.
+
+        Uses :class:`~concurrent.futures.ThreadPoolExecutor` so multiple Groq
+        API calls run in parallel.  Order of results matches *inputs*.
 
         Each element of *inputs* must have keys: ``question``, ``ground_truth``,
         ``predicted``, and optionally ``context_turns``.
 
         Args:
             inputs: List of judge input dicts.
+            max_workers: Maximum concurrent requests.  For Groq free tier
+                (30 req/min on 70B) keep this ≤ 10 to avoid rate-limit cascades.
 
         Returns:
             Ordered list of :class:`JudgeVerdict` objects.
@@ -134,16 +140,26 @@ class CHDJudge:
         Raises:
             KeyError: If a required key is missing from any input dict.
         """
-        verdicts: list[JudgeVerdict] = []
-        for item in inputs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        verdicts: list[JudgeVerdict | None] = [None] * len(inputs)
+
+        def _call(idx: int, item: dict[str, Any]) -> tuple[int, JudgeVerdict]:
             verdict = self.judge(
                 question=item["question"],
                 ground_truth=item["ground_truth"],
                 predicted=item["predicted"],
                 context_turns=item.get("context_turns", ""),
             )
-            verdicts.append(verdict)
-        return verdicts
+            return idx, verdict
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_call, i, item): i for i, item in enumerate(inputs)}
+            for future in as_completed(futures):
+                idx, verdict = future.result()
+                verdicts[idx] = verdict
+
+        return verdicts  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
