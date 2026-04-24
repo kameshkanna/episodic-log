@@ -124,12 +124,15 @@ def summarize(  # noqa: PLR0912
 
     all_sessions = _load_index(sessions_index)
 
-    # Filter out already-summarized sessions unless overwriting.
+    # Filter out sessions that already have a valid (non-empty) summary file.
+    # Zero-byte or zero-line files are treated as absent so crashed runs don't
+    # permanently block re-summarization without --overwrite.
+    def _summary_is_valid(s: dict) -> bool:
+        p = Path(s["summaries_dir"]) / f"{method}.jsonl"
+        return p.exists() and p.stat().st_size > 0 and p.read_text(encoding="utf-8").strip() != ""
+
     if not overwrite:
-        pending = [
-            s for s in all_sessions
-            if not (Path(s["summaries_dir"]) / f"{method}.jsonl").exists()
-        ]
+        pending = [s for s in all_sessions if not _summary_is_valid(s)]
     else:
         pending = all_sessions
 
@@ -257,11 +260,23 @@ def _run_sessions(
     tag = f"GPU{cuda_devices}" if cuda_devices is not None else "CPU"
     bar = tqdm(sessions, desc=f"{tag}/{method}", unit="session", dynamic_ncols=True, leave=True)
 
+    n_skipped = 0
+    n_written = 0
+    n_empty_log = 0
+
     for session_meta in bar:
         summaries_dir = Path(session_meta["summaries_dir"])
         summary_file  = summaries_dir / f"{method}.jsonl"
 
-        if summary_file.exists() and not overwrite:
+        # Treat zero-byte or zero-line files as absent — a crashed previous run
+        # can leave empty placeholder files that would otherwise block re-runs.
+        file_is_valid = (
+            summary_file.exists()
+            and summary_file.stat().st_size > 0
+            and summary_file.read_text(encoding="utf-8").strip()
+        )
+        if file_is_valid and not overwrite:
+            n_skipped += 1
             continue
 
         log_path = Path(session_meta["log_path"])
@@ -270,6 +285,13 @@ def _run_sessions(
             continue
 
         events = LogReader(log_path).load_all()
+        if not events:
+            worker_logger.warning(
+                "Session %s has 0 events in log.jsonl — no summaries written.",
+                session_meta["session_id"],
+            )
+            n_empty_log += 1
+            continue
 
         if summary_file.exists():
             summary_file.unlink()
@@ -288,24 +310,27 @@ def _run_sessions(
                 )
                 failed_events += 1
 
-        if failed_events == len(events) and events:
-            # All events failed — remove the (now empty) file so a re-run
-            # won't skip this session as "already done".
+        if failed_events == len(events):
             if summary_file.exists():
                 summary_file.unlink()
             worker_logger.error(
                 "ALL %d events failed for session %s — deleted empty %s.jsonl",
                 len(events), session_meta["session_id"], method,
             )
-        elif failed_events:
-            worker_logger.warning(
-                "Session %s: %d/%d events failed summarization.",
-                session_meta["session_id"], failed_events, len(events),
-            )
+        else:
+            n_written += 1
+            if failed_events:
+                worker_logger.warning(
+                    "Session %s: %d/%d events failed summarization.",
+                    session_meta["session_id"], failed_events, len(events),
+                )
 
-        bar.set_postfix({"session": session_meta["session_id"][:16], "failed_ev": failed_events})
+        bar.set_postfix({"written": n_written, "skipped": n_skipped, "failed_ev": failed_events})
 
-    worker_logger.info("%s: finished %d sessions", tag, len(sessions))
+    worker_logger.info(
+        "%s: done — written=%d  skipped(valid)=%d  empty_log=%d  total=%d",
+        tag, n_written, n_skipped, n_empty_log, len(sessions),
+    )
 
 
 # ---------------------------------------------------------------------------
