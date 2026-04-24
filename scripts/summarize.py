@@ -298,17 +298,28 @@ def _run_sessions(
 
         store = SummaryStore(summaries_dir)
         failed_events = 0
-        for event in events:
-            try:
-                summary = summarizer.summarize(event)
-                store.write(summary)
-            except Exception as exc:
-                worker_logger.error(
-                    "Summarize error: session=%s turn=%s method=%s: %s",
-                    session_meta["session_id"], event.turn_id, method, exc,
-                    exc_info=True,
-                )
-                failed_events += 1
+        try:
+            summaries = summarizer.summarize_batch(events)
+        except Exception as exc:
+            worker_logger.error(
+                "summarize_batch failed: session=%s method=%s: %s",
+                session_meta["session_id"], method, exc,
+                exc_info=True,
+            )
+            summaries = []
+            failed_events = len(events)
+
+        if failed_events == 0:
+            for event, summary in zip(events, summaries):
+                try:
+                    store.write(summary)
+                except Exception as exc:
+                    worker_logger.error(
+                        "Summarize error: session=%s turn=%s method=%s: %s",
+                        session_meta["session_id"], event.turn_id, method, exc,
+                        exc_info=True,
+                    )
+                    failed_events += 1
 
         if failed_events == len(events):
             if summary_file.exists():

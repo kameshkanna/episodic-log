@@ -123,6 +123,50 @@ class HaikuSummarizer(AbstractSummarizer):
             method=self.method,
         )
 
+    def summarize_batch(
+        self,
+        events: list[TurnEvent],
+        batch_size: int = 32,
+    ) -> list[TurnSummary]:
+        """Summarize *events* in batches using a single model.generate() per batch.
+
+        When the provider exposes ``generate_batch``, all turns in a batch are
+        tokenized together and processed in one forward pass, giving ~20× the
+        throughput of sequential single-item calls.  Falls back to the base
+        sequential loop for providers that lack ``generate_batch``.
+
+        Args:
+            events: All events to summarise (typically one full session).
+            batch_size: Number of turns per ``generate_batch`` call. Tune to
+                GPU VRAM; 32 is safe for a 7B model on an 80 GB A100.
+
+        Returns:
+            List of :class:`TurnSummary` objects in the same order as *events*.
+        """
+        if not hasattr(self._provider, "generate_batch"):
+            return super().summarize_batch(events)
+
+        results: list[TurnSummary] = []
+        for start in range(0, len(events), batch_size):
+            chunk = events[start: start + batch_size]
+            batch_messages = [
+                [{"role": "user", "content": _format_prompt(e)}] for e in chunk
+            ]
+            raw_summaries = self._provider.generate_batch(  # type: ignore[attr-defined]
+                batch_messages,
+                system=_SYSTEM_PROMPT,
+                max_tokens=_MAX_TOKENS,
+                temperature=_TEMPERATURE,
+            )
+            for event, raw in zip(chunk, raw_summaries):
+                results.append(TurnSummary(
+                    turn_id=event.turn_id,
+                    session_id=event.session_id,
+                    summary=raw.strip(),
+                    method=self.method,
+                ))
+        return results
+
 
 # ------------------------------------------------------------------
 # Module-level helpers

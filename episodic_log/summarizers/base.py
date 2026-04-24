@@ -54,3 +54,18 @@ class AbstractSummarizer(ABC):
             TypeError: If *event* is not a :class:`~episodic_log.core.turn_event.TurnEvent`.
         """
         ...
+
+    def summarize_batch(self, events: list[TurnEvent]) -> list[TurnSummary]:
+        """Summarize a list of events, returning one :class:`TurnSummary` per event.
+
+        The default implementation calls :meth:`summarize` sequentially.
+        Subclasses backed by a batching-capable provider should override this
+        to issue a single batched inference call instead.
+
+        Args:
+            events: Ordered list of :class:`TurnEvent` objects to summarise.
+
+        Returns:
+            List of :class:`TurnSummary` objects in the same order as *events*.
+        """
+        return [self.summarize(e) for e in events]

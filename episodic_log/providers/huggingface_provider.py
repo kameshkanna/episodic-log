@@ -86,6 +86,102 @@ class HuggingFaceProvider(BaseProvider):
     def model_id(self) -> str:
         return self._model_name
 
+    def generate_batch(
+        self,
+        batch_messages: list[list[dict[str, str]]],
+        system: str | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> list[str]:
+        """Generate responses for a batch of message lists in a single forward pass.
+
+        Left-pads all sequences to the same length so the batch fits in a single
+        ``model.generate()`` call, amortising CUDA launch and Python overhead across
+        the entire batch.  Falls back to sequential calls if batch size is 1.
+
+        Args:
+            batch_messages: List of message lists, one per item in the batch.
+            system: Optional system prompt applied uniformly to every item.
+            max_tokens: Maximum new tokens to generate per item.
+            temperature: Sampling temperature; 0.0 uses greedy decoding.
+
+        Returns:
+            List of stripped response strings, in the same order as *batch_messages*.
+        """
+        import torch  # type: ignore[import]
+
+        if len(batch_messages) == 1:
+            return [self.generate(batch_messages[0], system=system,
+                                   max_tokens=max_tokens, temperature=temperature)]
+
+        prompts: list[str] = []
+        for messages in batch_messages:
+            chat: list[dict[str, str]] = []
+            if system:
+                chat.append({"role": "system", "content": system})
+            chat.extend(normalize_messages(messages))
+            try:
+                prompt = self._tokenizer.apply_chat_template(
+                    chat, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt = "\n".join(
+                    f"{m['role'].upper()}: {m['content']}" for m in chat
+                ) + "\nASSISTANT:"
+            prompts.append(prompt)
+
+        # Left-pad for decoder-only batch generation.
+        orig_padding_side = self._tokenizer.padding_side
+        self._tokenizer.padding_side = "left"
+        if self._tokenizer.pad_token_id is None:
+            self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
+
+        try:
+            inputs = self._tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            )
+        finally:
+            self._tokenizer.padding_side = orig_padding_side
+
+        device = next(self._model.parameters()).device
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        do_sample = temperature > 0.0
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+
+        input_len = input_ids.shape[-1]
+        with torch.inference_mode():
+            output_ids = self._model.generate(input_ids, **gen_kwargs)
+
+        results: list[str] = []
+        for i in range(len(prompts)):
+            new_ids = output_ids[i][input_len:]
+            text = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+            results.append(text.strip())
+
+        del input_ids, output_ids
+        if attention_mask is not None:
+            del attention_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        return results
+
     def generate(
         self,
         messages: list[str] | list[dict[str, str]],
