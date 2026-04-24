@@ -26,11 +26,10 @@ _SYNTHETIC_EPOCH = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 _TURN_ID_WIDTH = 4
 
 # HuggingFace dataset coordinates.
-# longmemeval_s_cleaned.json contains single-session instances WITH session_history.
-# longmemeval_oracle.json has Q&A metadata only (no session_history).
+# longmemeval_s_cleaned.json: single-session instances with haystack_sessions,
+# answer_session_ids, question, answer, question_type — all fields needed.
 _HF_DATASET_NAME = "xiaowu0162/longmemeval-cleaned"
 _HF_SESSION_FILE = "longmemeval_s_cleaned.json"
-_HF_ORACLE_FILE = "longmemeval_oracle.json"
 
 
 @dataclass
@@ -99,8 +98,13 @@ class LongMemEvalIngestor:
     def ingest(self, instance: dict[str, Any], split: str = "test") -> IngestedSession:
         """Convert one LongMemEval instance to ``log.jsonl`` and return metadata.
 
-        The method is idempotent: if the target ``log.jsonl`` already exists it
-        is overwritten so that re-runs stay consistent with the source data.
+        The ``s_cleaned`` format stores conversations as a haystack of multiple
+        sessions (``haystack_sessions`` / ``haystack_session_ids``).  All sessions
+        are flattened into one ordered turn list; ``answer_session_ids`` (string
+        session IDs) are resolved to contiguous ``turn_id`` ranges for
+        ``evidence_turn_ids``.
+
+        The method is idempotent: the ``log.jsonl`` is overwritten on every call.
 
         Args:
             instance: A single LongMemEval dict as loaded from HuggingFace.
@@ -111,28 +115,50 @@ class LongMemEvalIngestor:
 
         Raises:
             KeyError: If ``instance`` is missing required fields.
-            ValueError: If ``session_history`` contains a turn with an
-                unrecognised role string.
+            ValueError: If a turn's role string is unrecognised.
         """
         self._validate_instance(instance)
 
         question_id: str = instance["question_id"]
         session_id: str = _question_id_to_session_id(question_id)
-        session_history: list[dict[str, str]] = instance.get("session_history") or []
-        if not session_history:
-            logger.warning(
-                "session_history is empty for question_id=%s — session will have no turns.",
-                question_id,
-            )
         question: str = instance["question"]
         raw_answer: str | list[str] = instance["answer"]
         answer: str = _normalise_answer(raw_answer)
-        evidence_session_ids: list[int] = instance.get("evidence_session_ids") or []
         question_type: str = instance.get("question_type", "")
 
-        evidence_turn_ids: list[str] = [
-            _pad_turn_id(idx) for idx in evidence_session_ids
-        ]
+        # Flatten all haystack sessions into one ordered turn list, tracking
+        # the [start, end) turn-index range for each named session so we can
+        # resolve answer_session_ids to specific turn_ids later.
+        haystack_sessions: list[list[dict[str, str]]] = instance.get("haystack_sessions") or []
+        haystack_session_ids: list[str] = instance.get("haystack_session_ids") or []
+        answer_session_ids: list[str] = instance.get("answer_session_ids") or []
+
+        all_turns: list[dict[str, str]] = []
+        session_turn_ranges: dict[str, tuple[int, int]] = {}
+        for sess_id, sess_turns in zip(haystack_session_ids, haystack_sessions):
+            start = len(all_turns)
+            if isinstance(sess_turns, list):
+                all_turns.extend(sess_turns)
+            end = len(all_turns)
+            session_turn_ranges[sess_id] = (start, end)
+
+        if not all_turns:
+            logger.warning(
+                "haystack_sessions is empty for question_id=%s — session will have no turns.",
+                question_id,
+            )
+
+        # Map answer session string IDs → turn_ids in the flat log.
+        evidence_turn_ids: list[str] = []
+        for ans_sess_id in answer_session_ids:
+            if ans_sess_id in session_turn_ranges:
+                start, end = session_turn_ranges[ans_sess_id]
+                evidence_turn_ids.extend(_pad_turn_id(i) for i in range(start, end))
+            else:
+                logger.warning(
+                    "answer_session_id %r not found in haystack_session_ids for question_id=%s",
+                    ans_sess_id, question_id,
+                )
 
         session_dir = self._data_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -141,14 +167,15 @@ class LongMemEvalIngestor:
         summaries_dir.mkdir(parents=True, exist_ok=True)
 
         log_path = session_dir / "log.jsonl"
-        events = self._build_events(session_history, session_id)
+        events = self._build_events(all_turns, session_id)
         _write_jsonl(log_path, events)
 
         logger.info(
-            "Ingested session %s | split=%s | turns=%d | log=%s",
+            "Ingested session %s | split=%s | turns=%d | evidence_turns=%d | log=%s",
             session_id,
             split,
             len(events),
+            len(evidence_turn_ids),
             log_path,
         )
 
@@ -202,17 +229,16 @@ class LongMemEvalIngestor:
 
     @staticmethod
     def load_dataset(n: int | None = None, seed: int = 42) -> list[dict[str, Any]]:
-        """Load LongMemEval from HuggingFace, merging session histories with oracle metadata.
+        """Load LongMemEval single-session instances from HuggingFace.
 
-        Downloads ``longmemeval_s_cleaned.json`` (277 MB, single-session instances with
-        ``session_history``) and ``longmemeval_oracle.json`` (15 MB, Q&A oracle metadata)
-        from ``xiaowu0162/longmemeval-cleaned`` via ``huggingface_hub``.  The ``datasets``
-        library is intentionally bypassed because the repo also contains a 2.7 GB
-        multi-session file that overflows PyArrow's int32 block-size.
+        Downloads ``longmemeval_s_cleaned.json`` (277 MB) from
+        ``xiaowu0162/longmemeval-cleaned`` via ``huggingface_hub``.  Each instance
+        contains ``haystack_sessions`` (list of conversation sessions),
+        ``haystack_session_ids``, ``answer_session_ids``, ``question``, ``answer``,
+        and ``question_type`` — all fields needed by :meth:`ingest`.
 
-        The two files are merged on ``question_id``: oracle fields
-        (``answer``, ``evidence_session_ids``) are overlaid onto session instances so
-        the returned dicts always contain both ``session_history`` and oracle ground truth.
+        The ``datasets`` library is intentionally bypassed because the repo also
+        contains a 2.7 GB multi-session file that overflows PyArrow's int32 block-size.
 
         The returned list is shuffled with *seed* for reproducibility; when *n*
         is provided only the first *n* instances after shuffling are returned.
@@ -222,8 +248,7 @@ class LongMemEvalIngestor:
             seed: Random seed used to shuffle the full instance list.
 
         Returns:
-            A plain Python list of instance dicts, each matching the
-            LongMemEval schema documented in this module.
+            A plain Python list of instance dicts.
 
         Raises:
             ImportError: If ``huggingface_hub`` is not installed.
@@ -242,58 +267,25 @@ class LongMemEvalIngestor:
                 "huggingface_hub is required. Install it with: pip install huggingface-hub"
             ) from exc
 
-        # Load single-session instances (has session_history).
         logger.info(
             "Downloading %s / %s from HuggingFace…",
             _HF_DATASET_NAME,
             _HF_SESSION_FILE,
         )
-        session_path = hf_hub_download(
+        local_path = hf_hub_download(
             repo_id=_HF_DATASET_NAME,
             filename=_HF_SESSION_FILE,
             repo_type="dataset",
         )
-        with open(session_path, "r", encoding="utf-8") as fh:
-            session_instances: list[dict[str, Any]] = json.load(fh)
-
-        # Load oracle metadata (has ground-truth answers + evidence_session_ids).
-        logger.info(
-            "Downloading %s / %s from HuggingFace…",
-            _HF_DATASET_NAME,
-            _HF_ORACLE_FILE,
-        )
-        oracle_path = hf_hub_download(
-            repo_id=_HF_DATASET_NAME,
-            filename=_HF_ORACLE_FILE,
-            repo_type="dataset",
-        )
-        with open(oracle_path, "r", encoding="utf-8") as fh:
-            oracle_instances: list[dict[str, Any]] = json.load(fh)
-
-        # Build oracle lookup: question_id → oracle dict.
-        oracle_by_id: dict[str, dict[str, Any]] = {
-            inst["question_id"]: inst for inst in oracle_instances
-        }
-
-        # Merge oracle fields into session instances.
-        instances: list[dict[str, Any]] = []
-        for inst in session_instances:
-            qid = inst.get("question_id", "")
-            merged = dict(inst)
-            if qid in oracle_by_id:
-                # Oracle fields take precedence for answer/evidence — they are
-                # the ground-truth labels; session fields provide the history.
-                for key in ("answer", "evidence_session_ids", "question_type", "question"):
-                    if key in oracle_by_id[qid]:
-                        merged[key] = oracle_by_id[qid][key]
-            instances.append(merged)
+        with open(local_path, "r", encoding="utf-8") as fh:
+            instances: list[dict[str, Any]] = json.load(fh)
 
         rng = random.Random(seed)
         rng.shuffle(instances)
         if n is not None:
             instances = instances[:n]
 
-        logger.info("Loaded %d LongMemEval instances (with session_history).", len(instances))
+        logger.info("Loaded %d LongMemEval instances.", len(instances))
         return instances
 
     # ------------------------------------------------------------------
@@ -354,7 +346,7 @@ class LongMemEvalIngestor:
         """
         if not isinstance(instance, dict):
             raise TypeError(f"instance must be a dict, got {type(instance)}")
-        for field_name in ("question_id", "question", "answer"):
+        for field_name in ("question_id", "question", "answer", "haystack_sessions"):
             if field_name not in instance:
                 raise KeyError(
                     f"LongMemEval instance is missing required field: '{field_name}'"
