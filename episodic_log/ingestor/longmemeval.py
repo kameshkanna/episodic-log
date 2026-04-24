@@ -239,6 +239,7 @@ class LongMemEvalIngestor:
             _HF_DATASET_NAME,
             _HF_DATASET_CONFIG,
             split=_HF_DATASET_SPLIT,
+            trust_remote_code=True,
         )
         ds = ds.shuffle(seed=seed)
         if n is not None:
