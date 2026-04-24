@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "episodic-log"
+version = "0.1.0"
+description = "Evaluating Conversational Hallucination Drift (CHD) on LongMemEval"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "tqdm>=4.66",
+    "typer>=0.12",
+    "rich>=13",
+    "datasets>=2.18",
+    "rank-bm25>=0.2.2",
+]
+
+[project.optional-dependencies]
+groq = ["groq>=0.9"]
+hf = [
+    "transformers>=4.44",
+    "torch>=2.2",
+    "bitsandbytes>=0.43",
+    "accelerate>=0.27",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+all = [
+    "episodic-log[groq]",
+    "episodic-log[hf]",
+    "episodic-log[dev]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["episodic_log*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true

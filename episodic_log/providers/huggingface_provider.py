@@ -1,0 +1,183 @@
+"""HuggingFace local model provider with 4-bit/8-bit quantization support."""
+
+from __future__ import annotations
+
+import gc
+import logging
+from typing import Any
+
+from episodic_log.providers.base import BaseProvider, normalize_messages
+
+logger = logging.getLogger(__name__)
+
+
+class HuggingFaceProvider(BaseProvider):
+    """LLM provider backed by a local HuggingFace causal language model.
+
+    Loads the model with ``transformers.AutoModelForCausalLM`` and applies
+    optional 4-bit or 8-bit quantization via ``BitsAndBytesConfig``.  Uses
+    ``apply_chat_template`` for prompt construction.
+
+    Args:
+        model_name: HuggingFace model ID or local path.
+        quantization: One of ``"4bit"``, ``"8bit"``, or ``None`` (full precision).
+        device_map: Device placement string passed to ``from_pretrained``
+            (e.g. ``"auto"``, ``"cuda:0"``).
+
+    Raises:
+        ImportError: If ``transformers`` is not installed.
+        ValueError: If *quantization* is not one of the accepted values.
+    """
+
+    _VALID_QUANTIZATIONS = (None, "4bit", "8bit")
+
+    def __init__(
+        self,
+        model_name: str,
+        quantization: str | None = None,
+        device_map: str = "auto",
+    ) -> None:
+        if quantization not in self._VALID_QUANTIZATIONS:
+            raise ValueError(
+                f"quantization must be one of {self._VALID_QUANTIZATIONS}, got {quantization!r}"
+            )
+        try:
+            import transformers  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "The 'transformers' package is required. Install with: pip install transformers"
+            ) from exc
+
+        self._model_name = model_name
+        logger.info(
+            "HuggingFaceProvider: loading model=%s quantization=%s device_map=%s",
+            model_name,
+            quantization,
+            device_map,
+        )
+
+        bnb_config = _build_bnb_config(quantization)
+        kwargs: dict[str, Any] = {
+            "device_map": device_map,
+            "torch_dtype": "auto",
+            "trust_remote_code": True,
+        }
+        if bnb_config is not None:
+            kwargs["quantization_config"] = bnb_config
+
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
+        self._model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_name, **kwargs
+        )
+        self._model.eval()
+        logger.info("HuggingFaceProvider: model loaded.")
+
+    @property
+    def model_id(self) -> str:
+        return self._model_name
+
+    def generate(
+        self,
+        messages: list[str] | list[dict[str, str]],
+        system: str | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> str:
+        """Generate a response from the local model.
+
+        Args:
+            messages: Alternating user/assistant strings or chat-message dicts.
+            system: Optional system prompt prepended as a system-role message.
+            max_tokens: Maximum new tokens to generate.
+            temperature: Sampling temperature; 0.0 uses greedy decoding.
+
+        Returns:
+            The assistant's text response (decoded and stripped).
+
+        Raises:
+            RuntimeError: If generation fails.
+        """
+        import torch  # type: ignore[import]
+
+        chat: list[dict[str, str]] = []
+        if system:
+            chat.append({"role": "system", "content": system})
+        chat.extend(normalize_messages(messages))
+
+        try:
+            prompt: str = self._tokenizer.apply_chat_template(
+                chat,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            # Fallback: concatenate messages naively.
+            prompt = "\n".join(
+                f"{m['role'].upper()}: {m['content']}" for m in chat
+            ) + "\nASSISTANT:"
+
+        inputs = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )
+        device = next(self._model.parameters()).device
+        input_ids = inputs["input_ids"].to(device)
+
+        do_sample = temperature > 0.0
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(input_ids, **gen_kwargs)
+
+        new_ids = output_ids[0][input_ids.shape[-1]:]
+        text: str = self._tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        # Explicitly free GPU memory for the intermediate tensors.
+        del input_ids, output_ids, new_ids
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        return text.strip()
+
+
+def _build_bnb_config(quantization: str | None) -> Any | None:
+    """Build a ``BitsAndBytesConfig`` for the requested quantization level.
+
+    Args:
+        quantization: ``"4bit"``, ``"8bit"``, or ``None``.
+
+    Returns:
+        A ``BitsAndBytesConfig`` instance, or ``None`` for full precision.
+    """
+    if quantization is None:
+        return None
+
+    try:
+        from transformers import BitsAndBytesConfig  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required for quantization. "
+            "Install with: pip install bitsandbytes"
+        ) from exc
+
+    if quantization == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype="bfloat16",
+        )
+    if quantization == "8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+
+    raise ValueError(f"Unsupported quantization: {quantization!r}")
