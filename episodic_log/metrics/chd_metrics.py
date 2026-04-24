@@ -21,12 +21,13 @@ _ALL_CATEGORIES = (*_CHD_ERROR_CATEGORIES, "correct")
 
 @dataclass
 class CHDMetrics:
-    """Aggregated CHD metrics for one condition × summarizer combination.
+    """Aggregated CHD metrics for one model × condition × summarizer combination.
 
     Attributes:
         condition_name: Condition label (e.g. ``"episodic"``).
         summary_method: Summarizer method used (e.g. ``"structured"``).
         total: Total number of evaluated instances.
+        model_slug: Short model identifier (e.g. ``"llama-3.1-8b"``).
         counts: Per-category counts including ``"correct"``.
         accuracy: Fraction of instances with verdict ``"correct"``.
         chd_rate: Fraction of instances with any CHD error category.
@@ -36,6 +37,7 @@ class CHDMetrics:
     condition_name: str
     summary_method: str
     total: int
+    model_slug: str = "unknown"
     counts: dict[str, int] = field(default_factory=dict)
     accuracy: float = 0.0
     chd_rate: float = 0.0
@@ -46,6 +48,7 @@ def compute_metrics(
     results: list[dict[str, Any]],
     condition_name: str,
     summary_method: str = "structured",
+    model_slug: str = "unknown",
 ) -> CHDMetrics:
     """Compute CHD metrics from a list of judge result dicts.
 
@@ -56,6 +59,7 @@ def compute_metrics(
         results: List of result dicts, each with at minimum a ``"verdict"`` key.
         condition_name: Name of the condition being evaluated.
         summary_method: Summarizer method used (for labelling).
+        model_slug: Short model identifier for the comparison table.
 
     Returns:
         A populated :class:`CHDMetrics` instance.
@@ -87,6 +91,7 @@ def compute_metrics(
         condition_name=condition_name,
         summary_method=summary_method,
         total=total,
+        model_slug=model_slug,
         counts=dict(counts),
         accuracy=accuracy,
         chd_rate=chd_rate,
@@ -148,6 +153,7 @@ def print_comparison_table(metrics_list: list[CHDMetrics]) -> None:
         header_style="bold cyan",
         title="CHD Evaluation Results",
     )
+    table.add_column("Model", style="dim")
     table.add_column("Condition", style="bold")
     table.add_column("Method")
     table.add_column("N", justify="right")
@@ -158,9 +164,10 @@ def print_comparison_table(metrics_list: list[CHDMetrics]) -> None:
     table.add_column("Distortion", justify="right")
     table.add_column("Confab.", justify="right")
 
-    for m in sorted(metrics_list, key=lambda x: (-x.accuracy, x.condition_name)):
+    for m in sorted(metrics_list, key=lambda x: (x.model_slug, -x.accuracy, x.condition_name)):
         chd_color = "red" if m.chd_rate > 0.3 else "yellow" if m.chd_rate > 0.1 else "green"
         table.add_row(
+            m.model_slug,
             m.condition_name,
             m.summary_method,
             str(m.total),

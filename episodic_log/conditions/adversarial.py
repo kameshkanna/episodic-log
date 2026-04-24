@@ -54,5 +54,5 @@ def _shift_ids(turn_ids: list[str]) -> list[str]:
         ordinal = int(tid)
         delta = _SHIFT if i % 2 == 0 else -_SHIFT
         new_ordinal = max(0, min(9999, ordinal + delta))
-        shifted.append(str(new_ordinal).zfill(len(tid)))
+        shifted.append(str(new_ordinal).zfill(4))
     return shifted

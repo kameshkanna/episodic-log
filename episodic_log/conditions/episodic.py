@@ -33,10 +33,10 @@ _SYSTEM_PROMPT = (
 )
 
 _TOOL_CALL_RE = re.compile(
-    r'\{"name"\s*:\s*"read_summaries".*?"query"\s*:\s*"([^"]+)"',
+    r'"name"\s*:\s*"read_summaries".*?"query"\s*:\s*"((?:[^"\\]|\\.)*)"',
     re.DOTALL,
 )
-_ANSWER_RE = re.compile(r"ANSWER:\s*(.+)", re.IGNORECASE | re.DOTALL)
+_ANSWER_RE = re.compile(r"ANSWER:\s*([^\n]+)", re.IGNORECASE)
 
 
 class EpisodicCondition(BaseCondition):
@@ -130,7 +130,7 @@ class EpisodicCondition(BaseCondition):
         try:
             index = store.get_index(self._summary_method)
             return index.query(query, k=_TOP_K)
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
             logger.warning(
                 "No summaries found for method=%s — returning empty retrieval.",
                 self._summary_method,

@@ -8,33 +8,49 @@ from episodic_log.providers.huggingface_provider import HuggingFaceProvider
 
 
 def get_provider(spec: str, **kwargs) -> BaseProvider:
-    """Instantiate a provider from a ``"backend:model"`` spec string.
+    """Instantiate a provider from a spec string.
 
-    Supported prefixes:
-        - ``groq:<model>``   — :class:`GroqProvider`
-        - ``hf:<model>``     — :class:`HuggingFaceProvider`
+    Spec formats:
+        ``groq:<model>``             — :class:`GroqProvider`
+        ``hf:<org>/<model>``         — :class:`HuggingFaceProvider` (BF16)
+        ``hf:<org>/<model>:4bit``    — :class:`HuggingFaceProvider` (4-bit NF4)
+        ``hf:<org>/<model>:8bit``    — :class:`HuggingFaceProvider` (8-bit)
 
     Args:
-        spec: Provider spec string, e.g. ``"groq:llama-3.1-8b-instant"``.
-        **kwargs: Extra kwargs forwarded to the provider constructor.
+        spec: Provider spec string.
+        **kwargs: Extra kwargs forwarded to the provider constructor
+            (e.g. ``device_map="cuda:0"``).
 
     Returns:
         An initialised :class:`BaseProvider` subclass.
 
     Raises:
-        ValueError: If the prefix is not recognised.
+        ValueError: If the prefix or quantization value is not recognised.
     """
     if ":" not in spec:
-        raise ValueError(f"Provider spec must be '<backend>:<model>', got {spec!r}")
-    backend, model = spec.split(":", 1)
-    backend = backend.lower()
+        raise ValueError(f"Provider spec must be '<backend>:<model>[:<quant>]', got {spec!r}")
+    parts = spec.split(":")
+    backend = parts[0].lower()
+
     if backend == "groq":
+        model = ":".join(parts[1:])
         return GroqProvider(model=model, **kwargs)
+
     if backend in ("hf", "huggingface"):
-        return HuggingFaceProvider(model_name=model, **kwargs)
-    raise ValueError(
-        f"Unknown provider backend '{backend}'. Supported: groq, hf"
-    )
+        _QUANT_VALUES = ("4bit", "8bit")
+        if len(parts) >= 3 and parts[-1] in _QUANT_VALUES:
+            quantization: str | None = parts[-1]
+            model_name = ":".join(parts[1:-1])
+        else:
+            quantization = None
+            model_name = ":".join(parts[1:])
+        return HuggingFaceProvider(
+            model_name=model_name,
+            quantization=quantization,
+            **kwargs,
+        )
+
+    raise ValueError(f"Unknown provider backend '{backend}'. Supported: groq, hf")
 
 
 __all__ = [

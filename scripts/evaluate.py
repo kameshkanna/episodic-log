@@ -2,18 +2,23 @@
 
 Usage
 -----
-# Baseline (no memory) — 5 sessions, Groq provider
-python scripts/evaluate.py --condition baseline --n 5 --provider groq:llama-3.1-8b-instant
+# Baseline — 5 sessions, local 8B model
+python scripts/evaluate.py --condition baseline --n 5 \
+    --provider hf:meta-llama/Llama-3.1-8B-Instruct
 
-# Episodic with structured summaries
+# Episodic + 72B 4-bit, structured summaries
 python scripts/evaluate.py --condition episodic --summary-method structured \
-    --provider groq:llama-3.1-8b-instant
+    --provider hf:Qwen/Qwen2.5-72B-Instruct:4bit
 
-# Full run — all sessions
-python scripts/evaluate.py --condition episodic --provider groq:llama-3.1-8b-instant
+# All sessions with Groq + CHD judge
+python scripts/evaluate.py --condition episodic \
+    --provider groq:llama-3.3-70b-versatile \
+    --judge --judge-provider groq:llama-3.1-70b-versatile
 
-# With CHD judging (uses a separate judge provider)
-python scripts/evaluate.py --condition episodic --judge --judge-provider groq:llama-3.1-70b-versatile
+# Explicit model slug (overrides auto-derived name in output path)
+python scripts/evaluate.py --condition baseline \
+    --provider hf:Qwen/Qwen2.5-7B-Instruct \
+    --model-slug qwen-2.5-7b
 """
 
 from __future__ import annotations
@@ -82,6 +87,16 @@ def evaluate(
         str,
         typer.Option("--judge-provider", help="Provider spec for the CHD judge."),
     ] = "groq:llama-3.1-70b-versatile",
+    model_slug: Annotated[
+        str | None,
+        typer.Option(
+            "--model-slug",
+            help=(
+                "Short identifier used in the output path (data/results/<model-slug>/). "
+                "Auto-derived from --provider if omitted."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Run *condition* on all sessions and write per-result JSONL."""
     if condition not in ALL_CONDITIONS:
@@ -107,10 +122,14 @@ def evaluate(
     sessions_meta = _load_index(sessions_index)
     if n is not None:
         sessions_meta = sessions_meta[:n]
+
+    slug = model_slug or _derive_slug(provider_spec)
+    typer.echo(f"Model slug: {slug}")
     typer.echo(f"Running condition={condition!r} on {len(sessions_meta)} sessions …")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{condition}__{summary_method}.jsonl"
+    model_output_dir = output_dir / slug
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = model_output_dir / f"{condition}__{summary_method}.jsonl"
 
     failed = 0
     iterator = tqdm(sessions_meta, desc=f"{condition}/{summary_method}", unit="session", dynamic_ncols=True)
@@ -168,6 +187,43 @@ def evaluate(
     typer.echo(
         f"Done. Results written to {output_path}  (failed={failed})"
     )
+
+
+def _derive_slug(provider_spec: str) -> str:
+    """Derive a filesystem-safe short slug from a provider spec string.
+
+    Examples:
+        ``groq:llama-3.1-8b-instant`` → ``llama-3.1-8b-instant``
+        ``hf:Qwen/Qwen2.5-72B-Instruct:4bit`` → ``qwen2.5-72b-4bit``
+        ``hf:meta-llama/Llama-3.1-8B-Instruct`` → ``llama-3.1-8b``
+    """
+    parts = provider_spec.split(":")
+    # Strip backend prefix.
+    if parts[0].lower() in ("groq", "hf", "huggingface"):
+        rest = ":".join(parts[1:])
+    else:
+        rest = provider_spec
+
+    # For hf specs: take model name after org/, strip quantization suffix.
+    quant_suffix = ""
+    if rest.endswith(":4bit"):
+        quant_suffix = "-4bit"
+        rest = rest[:-5]
+    elif rest.endswith(":8bit"):
+        quant_suffix = "-8bit"
+        rest = rest[:-5]
+
+    # Use only the model name after org slash.
+    model_part = rest.split("/")[-1]
+    slug = model_part.lower().replace("_", "-")
+    # Remove common verbose tokens (suffix or mid-string before version tag).
+    for token in ("-instruct", "-it", "-chat", "-hf"):
+        # Remove as suffix.
+        if slug.endswith(token):
+            slug = slug[: -len(token)]
+        # Remove mid-string (e.g. -instruct-v0.3 → -v0.3).
+        slug = slug.replace(token + "-", "-")
+    return slug + quant_suffix
 
 
 def _load_index(path: Path) -> list[dict]:

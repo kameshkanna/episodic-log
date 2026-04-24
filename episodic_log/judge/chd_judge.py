@@ -47,7 +47,7 @@ where <category> is one of: commission, omission, distortion, confabulation, cor
 """
 
 _VERDICT_RE = re.compile(
-    r'\{"verdict"\s*:\s*"([^"]+)".*?"confidence"\s*:\s*([0-9.]+).*?"reason"\s*:\s*"([^"]+)"',
+    r'"verdict"\s*:\s*"([^"]+)".*?"confidence"\s*:\s*([0-9.]+).*?"reason"\s*:\s*"((?:[^"\\]|\\.)*)"',
     re.DOTALL,
 )
 

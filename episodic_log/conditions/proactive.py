@@ -58,7 +58,7 @@ class ProactiveCondition(BaseCondition):
         try:
             index = store.get_index(self._summary_method)
             turn_ids = index.query(question, k=_TOP_K)
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
             logger.warning(
                 "No summaries for method=%s in session=%s — injecting no context.",
                 self._summary_method,

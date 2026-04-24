@@ -43,8 +43,7 @@ class IngestedSession:
         summaries_dir: Absolute path to the directory where summarizer JSONL
             outputs for this session should be written.
         question: The evaluation question posed to the agent.
-        answer: Ground-truth answer string.  When the original field is a list
-            the individual strings are joined with ``"; "``.
+        answer: Ground-truth answer string.  Lists are joined with ``"; "`` during ingestion.
         evidence_turn_ids: Ordered list of zero-padded ``turn_id`` strings that
             correspond to ``evidence_session_ids`` from the original instance.
         question_type: One of ``"single-session-user"``,
@@ -118,9 +117,14 @@ class LongMemEvalIngestor:
         question_id: str = instance["question_id"]
         session_id: str = _question_id_to_session_id(question_id)
         session_history: list[dict[str, str]] = instance.get("session_history") or []
+        if not session_history:
+            logger.warning(
+                "session_history is empty for question_id=%s — session will have no turns.",
+                question_id,
+            )
         question: str = instance["question"]
         raw_answer: str | list[str] = instance["answer"]
-        answer: str | list[str] = _normalise_answer(raw_answer)
+        answer: str = _normalise_answer(raw_answer)
         evidence_session_ids: list[int] = instance.get("evidence_session_ids") or []
         question_type: str = instance.get("question_type", "")
 
@@ -340,8 +344,8 @@ def _question_id_to_session_id(question_id: str) -> str:
     return "_".join(question_id.lower().split())
 
 
-def _normalise_answer(raw: str | list[str]) -> str | list[str]:
-    """Return the answer in a consistent form.
+def _normalise_answer(raw: str | list[str]) -> str:
+    """Return the answer as a plain string.
 
     When the raw answer is a list its elements are joined with ``"; "`` so that
     downstream components always receive a plain string.
@@ -350,11 +354,11 @@ def _normalise_answer(raw: str | list[str]) -> str | list[str]:
         raw: Original answer value from the dataset instance.
 
     Returns:
-        Normalised answer: a plain string, or the original string if already one.
+        Normalised answer string.
     """
     if isinstance(raw, list):
         return "; ".join(str(item) for item in raw)
-    return raw
+    return str(raw)
 
 
 def _parse_role(role_str: str, turn_idx: int) -> EventRole:

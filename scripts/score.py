@@ -78,9 +78,10 @@ def score(
                 err=True,
             )
             raise typer.Exit(1)
-        paths = sorted(results_dir.glob("*.jsonl"))
+        # Support both flat layout (results/*.jsonl) and per-model layout (results/<slug>/*.jsonl).
+        paths = sorted(results_dir.glob("**/*.jsonl"))
         if not paths:
-            typer.echo(f"No *.jsonl files found in {results_dir}.", err=True)
+            typer.echo(f"No *.jsonl files found in {results_dir} (searched recursively).", err=True)
             raise typer.Exit(1)
 
     all_metrics: list[CHDMetrics] = []
@@ -92,12 +93,15 @@ def score(
             logger.error("Failed to load %s: %s", path, exc)
             continue
 
-        # Determine condition and method from filename (condition__method.jsonl).
+        # Derive condition, method, and model slug from path.
+        # Layout: data/results/<model-slug>/<condition>__<method>.jsonl
         stem = path.stem
         if "__" in stem:
             condition_name, summary_method = stem.split("__", 1)
         else:
             condition_name, summary_method = stem, "unknown"
+        # If file is inside a subdirectory, treat that directory name as model slug.
+        model_slug = path.parent.name if path.parent != results_dir else "unknown"
 
         # Only compute verdict-based metrics if judge has been run.
         judged = [r for r in data if r.get("verdict") is not None]
@@ -106,6 +110,7 @@ def score(
                 results=judged,
                 condition_name=condition_name,
                 summary_method=summary_method,
+                model_slug=model_slug,
             )
         else:
             logger.warning(
@@ -116,6 +121,7 @@ def score(
                 condition_name=condition_name,
                 summary_method=summary_method,
                 total=len(data),
+                model_slug=model_slug,
             )
 
         all_metrics.append(metrics)
