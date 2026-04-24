@@ -63,11 +63,12 @@ class ModelSpec:
     """One entry in the experiment model matrix.
 
     Attributes:
-        spec: Provider spec string (e.g. ``hf:org/model:4bit``).
+        spec: Provider spec string (e.g. ``hf:org/model``).
         slug: Filesystem-safe short identifier.
         size: ``"small"`` | ``"medium"`` | ``"large"``.
         family: Model family.
-        vram_gb: Approximate VRAM required (informational, used in dry-run).
+        vram_gb: Approximate VRAM required per model in BF16 (used for planning).
+        num_gpus_needed: How many A100 80 GB cards this model needs in BF16.
     """
 
     spec: str
@@ -75,21 +76,22 @@ class ModelSpec:
     size: str
     family: str
     vram_gb: int = 0
+    num_gpus_needed: int = 1
 
 
 MODEL_MATRIX: list[ModelSpec] = [
-    # --- Small (7–9B BF16, ~14–18 GB) ---
-    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",        "llama-3.1-8b",       "small",  "llama",   16),
-    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",                "qwen-2.5-7b",        "small",  "qwen",    14),
-    ModelSpec("hf:google/gemma-2-9b-it",                     "gemma-2-9b",         "small",  "gemma",   18),
-    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",       "mistral-7b",         "small",  "mistral", 14),
-    # --- Medium (14–27B BF16, ~28–54 GB — all fit in 80 GB) ---
-    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",               "qwen-2.5-14b",       "medium", "qwen",    28),
-    ModelSpec("hf:google/gemma-2-27b-it",                    "gemma-2-27b",        "medium", "gemma",   54),
-    # --- Large (32–72B 4-bit, ~16–36 GB — all fit in 80 GB) ---
-    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct:4bit",          "qwen-2.5-32b-4bit",  "large",  "qwen",    16),
-    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct:4bit",  "llama-3.3-70b-4bit", "large",  "llama",   35),
-    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct:4bit",          "qwen-2.5-72b-4bit",  "large",  "qwen",    36),
+    # --- Small (7–9B BF16, ~14–18 GB — 1 GPU) ---
+    ModelSpec("hf:meta-llama/Llama-3.1-8B-Instruct",       "llama-3.1-8b",  "small",  "llama",   16, 1),
+    ModelSpec("hf:Qwen/Qwen2.5-7B-Instruct",               "qwen-2.5-7b",   "small",  "qwen",    14, 1),
+    ModelSpec("hf:google/gemma-2-9b-it",                    "gemma-2-9b",    "small",  "gemma",   18, 1),
+    ModelSpec("hf:mistralai/Mistral-7B-Instruct-v0.3",      "mistral-7b",    "small",  "mistral", 14, 1),
+    # --- Medium (14–27B BF16, ~28–54 GB — 1 GPU) ---
+    ModelSpec("hf:Qwen/Qwen2.5-14B-Instruct",              "qwen-2.5-14b",  "medium", "qwen",    28, 1),
+    ModelSpec("hf:google/gemma-2-27b-it",                   "gemma-2-27b",   "medium", "gemma",   54, 1),
+    # --- Large (32B BF16 = 64 GB → 1 GPU; 70–72B BF16 = 140–144 GB → 2 GPUs) ---
+    ModelSpec("hf:Qwen/Qwen2.5-32B-Instruct",              "qwen-2.5-32b",  "large",  "qwen",    64, 1),
+    ModelSpec("hf:meta-llama/Llama-3.3-70B-Instruct",      "llama-3.3-70b", "large",  "llama",  140, 2),
+    ModelSpec("hf:Qwen/Qwen2.5-72B-Instruct",              "qwen-2.5-72b",  "large",  "qwen",   144, 2),
 ]
 
 _SIZE_LABELS = {"small", "medium", "large"}
@@ -210,8 +212,7 @@ def sweep(
                f"= {total_runs} result files  |  GPU slots: {num_gpus}\n")
 
     for i, m in enumerate(matrix):
-        slot = i if i < num_gpus else f"queued (slot free after GPU {i % num_gpus})"
-        typer.echo(f"  [{i:>2}] {m.slug:<28} ~{m.vram_gb:>2} GB  →  GPU slot {slot}")
+        typer.echo(f"  [{i:>2}] {m.slug:<28} ~{m.vram_gb:>3} GB  ×{m.num_gpus_needed} GPU(s)")
 
     if dry_run:
         return
@@ -244,15 +245,17 @@ def _run_gpu_queue(
     overwrite: bool,
     poll_interval: float = 5.0,
 ) -> None:
-    """Queue-based GPU scheduler.
+    """Queue-based GPU scheduler supporting variable GPU allocation per model.
 
-    Maintains up to *num_gpus* concurrent worker processes.  As soon as a GPU
-    slot is freed the next model in the queue starts on it immediately —
-    no idle GPUs, no waiting for slow models to synchronise.
+    Scans the pending queue on every tick and starts any model whose
+    ``num_gpus_needed`` can be satisfied by the current free-GPU pool.
+    Multi-GPU models receive a contiguous block and see them via
+    ``CUDA_VISIBLE_DEVICES``; HuggingFace ``device_map="auto"`` then
+    shards the weights across those cards automatically.
 
     Args:
         matrix: Ordered list of models to evaluate.
-        num_gpus: Maximum concurrent worker processes.
+        num_gpus: Total physical GPUs available.
         condition_list: Conditions to evaluate per model.
         method_list: Summarizer methods to evaluate per model.
         sessions_meta: Pre-loaded session index.
@@ -261,9 +264,8 @@ def _run_gpu_queue(
         poll_interval: Seconds between liveness checks on running workers.
     """
     if num_gpus == 1:
-        # Single-GPU path — no subprocess overhead.
         _gpu_worker(
-            gpu_id=0,
+            cuda_devices="0",
             assigned_models=matrix,
             condition_list=condition_list,
             method_list=method_list,
@@ -274,40 +276,51 @@ def _run_gpu_queue(
         return
 
     ctx = mp.get_context("spawn")
-    model_queue: list[ModelSpec] = list(matrix)
-    free_gpus: list[int]         = list(range(num_gpus))
-    running: dict[int, tuple[mp.Process, ModelSpec]] = {}  # gpu_id → (process, spec)
+    model_queue: list[ModelSpec]                          = list(matrix)
+    free_gpus:   list[int]                                = list(range(num_gpus))
+    # key = frozenset of assigned GPU IDs → (process, spec)
+    running: dict[frozenset[int], tuple[mp.Process, ModelSpec]] = {}
 
     while model_queue or running:
-        # Fill every free GPU slot.
-        while model_queue and free_gpus:
-            gpu_id     = free_gpus.pop(0)
-            model_spec = model_queue.pop(0)
-            p = ctx.Process(
-                target=_gpu_worker,
-                args=(gpu_id, [model_spec], condition_list, method_list,
-                      sessions_meta, output_dir, overwrite),
-                name=f"sweep-{model_spec.slug}",
-            )
-            p.start()
-            running[gpu_id] = (p, model_spec)
-            logger.info(
-                "GPU %d: started %-28s  [%d queued / %d running]",
-                gpu_id, model_spec.slug, len(model_queue), len(running),
-            )
+        # Scan queue for any model we can start right now.
+        started = True
+        while started:
+            started = False
+            for i, model_spec in enumerate(model_queue):
+                needed = model_spec.num_gpus_needed
+                if len(free_gpus) >= needed:
+                    assigned  = free_gpus[:needed]
+                    free_gpus = free_gpus[needed:]
+                    model_queue.pop(i)
+                    cuda_devices = ",".join(str(g) for g in assigned)
+                    p = ctx.Process(
+                        target=_gpu_worker,
+                        args=(cuda_devices, [model_spec], condition_list, method_list,
+                              sessions_meta, output_dir, overwrite),
+                        name=f"sweep-{model_spec.slug}",
+                    )
+                    p.start()
+                    key = frozenset(assigned)
+                    running[key] = (p, model_spec)
+                    logger.info(
+                        "GPUs [%s]: started %-28s  [%d queued / %d running]",
+                        cuda_devices, model_spec.slug, len(model_queue), len(running),
+                    )
+                    started = True
+                    break  # restart scan after each allocation
 
-        # Poll until at least one worker finishes.
+        # Poll for finished workers and reclaim their GPUs.
         time.sleep(poll_interval)
-        for gpu_id in list(running):
-            p, spec = running[gpu_id]
+        for key in list(running):
+            p, spec = running[key]
             if not p.is_alive():
                 p.join()
                 if p.exitcode != 0:
-                    logger.error("GPU %d (%s) exited with code %d", gpu_id, spec.slug, p.exitcode)
+                    logger.error("GPUs %s (%s) exited with code %d", set(key), spec.slug, p.exitcode)
                 else:
-                    logger.info("GPU %d: finished %s", gpu_id, spec.slug)
-                del running[gpu_id]
-                free_gpus.append(gpu_id)
+                    logger.info("GPUs %s: finished %s", set(key), spec.slug)
+                del running[key]
+                free_gpus.extend(sorted(key))
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +328,7 @@ def _run_gpu_queue(
 # ---------------------------------------------------------------------------
 
 def _gpu_worker(
-    gpu_id: int,
+    cuda_devices: str,
     assigned_models: list[ModelSpec],
     condition_list: list[str],
     method_list: list[str],
@@ -323,14 +336,15 @@ def _gpu_worker(
     output_dir: Path,
     overwrite: bool,
 ) -> None:
-    """Evaluate assigned models sequentially on one GPU.
+    """Evaluate assigned models sequentially on one or more GPUs.
 
     Called as a subprocess by :func:`_run_gpu_queue`.  Binds the process to
-    a single GPU via ``CUDA_VISIBLE_DEVICES`` so models never spill over to
-    neighbouring cards.
+    the assigned GPU(s) via ``CUDA_VISIBLE_DEVICES``; HuggingFace
+    ``device_map="auto"`` then shards weights across all visible cards.
 
     Args:
-        gpu_id: Physical GPU index to bind to.
+        cuda_devices: Comma-separated physical GPU indices (e.g. ``"0"`` or
+            ``"6,7"``).  Passed directly to ``CUDA_VISIBLE_DEVICES``.
         assigned_models: Models this worker evaluates in order.
         condition_list: Conditions to run for each model.
         method_list: Summarizer methods to run for each model.
@@ -338,17 +352,17 @@ def _gpu_worker(
         output_dir: Root results directory.
         overwrite: Whether to overwrite existing result files.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
     logging.basicConfig(
         level=logging.INFO,
-        format=f"%(asctime)s %(levelname)s [GPU{gpu_id}] %(name)s: %(message)s",
+        format=f"%(asctime)s %(levelname)s [GPU{cuda_devices}] %(name)s: %(message)s",
     )
     worker_logger = logging.getLogger(__name__)
 
     for model_spec in assigned_models:
         worker_logger.info("Loading %s", model_spec.spec)
         try:
-            provider = _load_provider(model_spec.spec, device_map="cuda:0")
+            provider = _load_provider(model_spec.spec, device_map="auto")
         except Exception as exc:
             worker_logger.error("Failed to load %s: %s", model_spec.spec, exc, exc_info=True)
             continue

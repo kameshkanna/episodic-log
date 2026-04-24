@@ -2,26 +2,28 @@
 
 Sessions are split evenly across all available GPUs so all 8 A100s work
 simultaneously — 8× faster than single-GPU sequential.  Any HF model size
-is supported, including large quantized models for higher-quality summaries.
+is supported.  For large BF16 models (32B+), use ``--gpus-per-worker`` so
+each worker spans multiple cards via ``device_map="auto"``.
 
 Usage
 -----
 # Structured (no model, CPU, fast)
 python scripts/summarize.py --method structured
 
-# Haiku — small model, all 8 GPUs in parallel
+# Haiku — small model, all 8 GPUs in parallel (1 GPU each)
 python scripts/summarize.py --method haiku \
     --provider hf:Qwen/Qwen2.5-7B-Instruct
 
-# Haiku — larger model for better summaries, 4-bit so it fits
+# Haiku — 32B BF16, 8 workers × 1 GPU each (32 GB fits in 80 GB A100)
 python scripts/summarize.py --method haiku \
-    --provider hf:Qwen/Qwen2.5-32B-Instruct:4bit
+    --provider hf:Qwen/Qwen2.5-32B-Instruct
 
-# Self-summarizer with 70B
+# Self-summarizer with 70B BF16, 4 workers × 2 GPUs each
 python scripts/summarize.py --method self \
-    --provider hf:meta-llama/Llama-3.3-70B-Instruct:4bit
+    --provider hf:meta-llama/Llama-3.3-70B-Instruct \
+    --gpus-per-worker 2
 
-# Explicit GPU count
+# Explicit total GPU count
 python scripts/summarize.py --method haiku \
     --provider hf:Qwen/Qwen2.5-7B-Instruct \
     --num-gpus 4
@@ -60,7 +62,7 @@ app = typer.Typer(
 
 
 @app.command()
-def summarize(
+def summarize(  # noqa: PLR0912
     method: Annotated[
         str,
         typer.Option(
@@ -87,15 +89,35 @@ def summarize(
         int | None,
         typer.Option(
             "--num-gpus",
-            help="GPUs to use in parallel (default: all available). Ignored for structured.",
+            help="Total GPUs to use (default: all available). Ignored for structured.",
         ),
     ] = None,
+    gpus_per_worker: Annotated[
+        int,
+        typer.Option(
+            "--gpus-per-worker",
+            help=(
+                "GPUs allocated to each worker process (default: 1). "
+                "Use 2 for 70B/72B BF16 models that need ~140 GB VRAM."
+            ),
+        ),
+    ] = 1,
     overwrite: Annotated[
         bool,
         typer.Option("--overwrite/--no-overwrite", help="Overwrite existing summary files."),
     ] = False,
 ) -> None:
-    """Generate TurnSummary JSONL files for every session in the index."""
+    """Generate TurnSummary JSONL files for every session in the index.
+
+    Args:
+        method: Summarizer method: ``structured`` | ``haiku`` | ``self``.
+        sessions_index: Path to the sessions index JSONL produced by ingest.py.
+        provider_spec: Provider spec string for model-backed methods.
+        num_gpus: Total GPUs to use (auto-detected if not set).
+        gpus_per_worker: GPUs per worker process; determines parallelism as
+            ``num_workers = num_gpus // gpus_per_worker``.
+        overwrite: Whether to overwrite existing summary files.
+    """
     if not sessions_index.exists():
         typer.echo(f"ERROR: sessions index not found at {sessions_index}. Run ingest.py first.", err=True)
         raise typer.Exit(1)
@@ -121,7 +143,7 @@ def summarize(
     # Structured is CPU-only — no GPU, no parallelization needed.
     if method == "structured":
         _run_sessions(
-            gpu_id=None,
+            cuda_devices=None,
             sessions=pending,
             method=method,
             provider_spec=None,
@@ -142,32 +164,43 @@ def summarize(
         except ImportError:
             num_gpus = 1
 
-    typer.echo(f"Provider: {provider_spec}  |  GPUs: {num_gpus}")
+    num_workers = max(1, num_gpus // gpus_per_worker)
+    typer.echo(
+        f"Provider: {provider_spec}  |  GPUs: {num_gpus}  |  "
+        f"Workers: {num_workers}  |  GPUs/worker: {gpus_per_worker}"
+    )
 
-    if num_gpus == 1:
+    # Build comma-separated CUDA_VISIBLE_DEVICES string per worker.
+    all_gpu_ids = list(range(num_gpus))
+    worker_devices: list[str] = [
+        ",".join(str(g) for g in all_gpu_ids[i * gpus_per_worker:(i + 1) * gpus_per_worker])
+        for i in range(num_workers)
+    ]
+
+    if num_workers == 1:
         _run_sessions(
-            gpu_id=0,
+            cuda_devices=worker_devices[0],
             sessions=pending,
             method=method,
             provider_spec=provider_spec,
             overwrite=overwrite,
         )
     else:
-        # Split sessions evenly across GPUs.
-        chunks = _split_sessions(pending, num_gpus)
+        # Split sessions evenly across workers.
+        chunks = _split_sessions(pending, num_workers)
         ctx = mp.get_context("spawn")
         processes: list[mp.Process] = []
-        for gpu_id, chunk in enumerate(chunks):
+        for worker_idx, (cuda_devs, chunk) in enumerate(zip(worker_devices, chunks)):
             if not chunk:
                 continue
             p = ctx.Process(
                 target=_run_sessions,
-                args=(gpu_id, chunk, method, provider_spec, overwrite),
-                name=f"summarize-gpu{gpu_id}",
+                args=(cuda_devs, chunk, method, provider_spec, overwrite),
+                name=f"summarize-worker{worker_idx}",
             )
             p.start()
             processes.append(p)
-            typer.echo(f"  GPU {gpu_id}: {len(chunk)} sessions")
+            typer.echo(f"  Worker {worker_idx} (GPUs {cuda_devs}): {len(chunk)} sessions")
 
         for p in processes:
             p.join()
@@ -182,27 +215,28 @@ def summarize(
 # ---------------------------------------------------------------------------
 
 def _run_sessions(
-    gpu_id: int | None,
+    cuda_devices: str | None,
     sessions: list[dict],
     method: str,
     provider_spec: str | None,
     overwrite: bool,
 ) -> None:
-    """Summarize a subset of sessions, optionally bound to one GPU.
+    """Summarize a subset of sessions, optionally bound to one or more GPUs.
 
     Args:
-        gpu_id: GPU index to bind via ``CUDA_VISIBLE_DEVICES``, or ``None``
-            for CPU-only methods.
+        cuda_devices: Comma-separated GPU indices to bind via
+            ``CUDA_VISIBLE_DEVICES`` (e.g. ``"0"`` or ``"6,7"``), or
+            ``None`` for CPU-only methods.
         sessions: Session metadata records to process.
         method: Summarizer method name.
         provider_spec: Provider spec string, or ``None`` for structured.
         overwrite: Whether to overwrite existing summary files.
     """
-    if gpu_id is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
         logging.basicConfig(
             level=logging.INFO,
-            format=f"%(asctime)s %(levelname)s [GPU{gpu_id}] %(name)s: %(message)s",
+            format=f"%(asctime)s %(levelname)s [GPU{cuda_devices}] %(name)s: %(message)s",
         )
     else:
         logging.basicConfig(
@@ -215,11 +249,12 @@ def _run_sessions(
     provider = None
     if provider_spec:
         from episodic_log.providers import get_provider
-        provider = get_provider(provider_spec, device_map="cuda:0" if gpu_id is not None else "cpu")
+        device_map = "auto" if cuda_devices is not None else "cpu"
+        provider = get_provider(provider_spec, device_map=device_map)
 
     summarizer = build_summarizer(method=method, provider=provider)
 
-    tag = f"GPU{gpu_id}" if gpu_id is not None else "CPU"
+    tag = f"GPU{cuda_devices}" if cuda_devices is not None else "CPU"
     bar = tqdm(sessions, desc=f"{tag}/{method}", unit="session", dynamic_ncols=True, leave=True)
 
     for session_meta in bar:
