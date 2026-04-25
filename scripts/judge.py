@@ -134,11 +134,13 @@ def judge_cmd(
         file_stats.append((path, pending))
         total_pending += pending
 
-    is_hf = judge_provider.lower().startswith("hf:") or judge_provider.lower().startswith("huggingface:")
+    is_vllm = judge_provider.lower().startswith("vllm:")
+    is_hf = judge_provider.lower().startswith(("hf:", "huggingface:"))
+    mode = "vLLM mega-batch" if is_vllm else ("HF multi-GPU" if is_hf else "API")
 
     typer.echo(
         f"Files: {len(paths)}  |  Pending rows: {total_pending}  |  "
-        f"Provider: {judge_provider}  |  Mode: {'HF multi-GPU' if is_hf else 'API'}"
+        f"Provider: {judge_provider}  |  Mode: {mode}"
     )
 
     if dry_run or total_pending == 0:
@@ -146,10 +148,16 @@ def judge_cmd(
             typer.echo("Nothing to judge.")
         return
 
-    # ── Route to HF parallel or API sequential ───────────────────────────
+    # ── Route to vLLM mega-batch, HF parallel, or API sequential ─────────
     pending_paths = [p for p, n in file_stats if n > 0]
 
-    if is_hf:
+    if is_vllm:
+        _run_vllm_mega_batch(
+            paths=pending_paths,
+            judge_provider_spec=judge_provider,
+            skip_judged=skip_judged,
+        )
+    elif is_hf:
         _run_hf_parallel(
             paths=pending_paths,
             judge_provider_spec=judge_provider,
@@ -167,6 +175,73 @@ def judge_cmd(
         )
 
     typer.echo(f"\nDone. {total_pending} verdicts written.")
+
+
+# ---------------------------------------------------------------------------
+# vLLM mega-batch path
+# ---------------------------------------------------------------------------
+
+def _run_vllm_mega_batch(
+    paths: list[Path],
+    judge_provider_spec: str,
+    skip_judged: bool,
+) -> None:
+    """Load vLLM once, collect every pending row, judge in a single generate_batch call.
+
+    Args:
+        paths: Result JSONL files with pending rows.
+        judge_provider_spec: vLLM provider spec, e.g. ``vllm:Qwen/...:tp8``.
+        skip_judged: Whether to skip rows that already have a verdict.
+    """
+    from episodic_log.providers import get_provider
+
+    provider = get_provider(judge_provider_spec)
+    judge = CHDJudge(provider=provider)
+
+    # Phase 1: load all files and collect pending (file_idx, row_idx) pairs.
+    all_files: list[tuple[Path, list[dict]]] = []
+    pending_jobs: list[tuple[int, int]] = []  # (file_idx, row_idx)
+
+    for file_idx, path in enumerate(paths):
+        rows = _load_jsonl(path)
+        all_files.append((path, rows))
+        for row_idx, row in enumerate(rows):
+            if skip_judged and row.get("verdict") is not None:
+                continue
+            pending_jobs.append((file_idx, row_idx))
+
+    if not pending_jobs:
+        logger.info("vLLM judge: nothing pending.")
+        return
+
+    logger.info("vLLM mega-batch judge: %d rows across %d files", len(pending_jobs), len(paths))
+
+    # Phase 2: build inputs list and call judge_batch_fast (single generate_batch).
+    inputs = [
+        {
+            "question":      all_files[fi][1][ri]["question"],
+            "ground_truth":  all_files[fi][1][ri]["ground_truth"],
+            "predicted":     all_files[fi][1][ri]["predicted_answer"],
+            "context_turns": "",
+        }
+        for fi, ri in pending_jobs
+    ]
+
+    bar = tqdm(total=len(inputs), desc="vLLM judging", unit="row", dynamic_ncols=True)
+    verdicts = judge.judge_batch_fast(inputs)
+    bar.update(len(verdicts))
+    bar.close()
+
+    # Phase 3: assign verdicts and write files.
+    for (fi, ri), verdict in zip(pending_jobs, verdicts):
+        row = all_files[fi][1][ri]
+        row["verdict"] = verdict.verdict
+        row["confidence"] = verdict.confidence
+        row["judge_reason"] = verdict.reason
+
+    for path, rows in all_files:
+        _write_jsonl(path, rows)
+        logger.info("Wrote verdicts → %s", path)
 
 
 # ---------------------------------------------------------------------------

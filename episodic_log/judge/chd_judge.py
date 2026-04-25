@@ -116,6 +116,49 @@ class CHDJudge:
         )
         return _parse_verdict(raw)
 
+    def judge_batch_fast(
+        self,
+        inputs: list[dict[str, Any]],
+    ) -> list[JudgeVerdict]:
+        """Judge all inputs in a single ``generate_batch()`` call.
+
+        Intended for vLLM where ``generate_batch()`` accepts an arbitrarily
+        large list and processes them with continuous batching.  Falls back to
+        sequential ``judge()`` calls for providers without ``generate_batch``.
+
+        Args:
+            inputs: List of dicts with keys ``question``, ``ground_truth``,
+                ``predicted``, and optionally ``context_turns``.
+
+        Returns:
+            Ordered list of :class:`JudgeVerdict` objects.
+        """
+        if not hasattr(self._provider, "generate_batch"):
+            return [
+                self.judge(
+                    question=item["question"],
+                    ground_truth=item["ground_truth"],
+                    predicted=item["predicted"],
+                    context_turns=item.get("context_turns", ""),
+                )
+                for item in inputs
+            ]
+
+        batch_messages = [
+            [{"role": "user", "content": _build_judge_input(
+                item["question"], item["ground_truth"],
+                item["predicted"], item.get("context_turns", ""),
+            )}]
+            for item in inputs
+        ]
+        raw_outputs = self._provider.generate_batch(  # type: ignore[attr-defined]
+            batch_messages,
+            system=_SYSTEM_PROMPT,
+            max_tokens=256,
+            temperature=0.0,
+        )
+        return [_parse_verdict(raw) for raw in raw_outputs]
+
     def judge_batch(
         self,
         inputs: list[dict[str, Any]],
