@@ -160,6 +160,19 @@ def summarize(  # noqa: PLR0912
         typer.echo("ERROR: --provider is required for scout/echo methods.", err=True)
         raise typer.Exit(1)
 
+    # vLLM path: single-process mega-batch — skip multiprocessing entirely.
+    # vLLM manages GPU parallelism internally via tensor parallelism.
+    if provider_spec.startswith("vllm:"):
+        typer.echo(f"Provider: {provider_spec}  |  mode=vllm-mega-batch")
+        _run_vllm_sessions(
+            sessions=pending,
+            method=method,
+            provider_spec=provider_spec,
+            overwrite=overwrite,
+        )
+        typer.echo(f"Done. {len(pending)} sessions summarized.")
+        return
+
     if num_gpus is None:
         try:
             import torch
@@ -342,6 +355,93 @@ def _run_sessions(
         "%s: done — written=%d  skipped(valid)=%d  empty_log=%d  total=%d",
         tag, n_written, n_skipped, n_empty_log, len(sessions),
     )
+
+
+# ---------------------------------------------------------------------------
+# vLLM mega-batch path
+# ---------------------------------------------------------------------------
+
+def _run_vllm_sessions(
+    sessions: list[dict],
+    method: str,
+    provider_spec: str,
+    overwrite: bool,
+) -> None:
+    """Single-process vLLM path: collect all events → one LLM.generate() call.
+
+    vLLM's continuous batching scheduler maximally utilises GPU bandwidth —
+    no Python multiprocessing needed when using tensor parallelism.
+
+    Args:
+        sessions: Session metadata records to process.
+        method: Summarizer method name (``"scout"`` or ``"echo"``).
+        provider_spec: vLLM provider spec, e.g. ``"vllm:Qwen/...:tp8"``.
+        overwrite: Whether to overwrite existing summary files.
+    """
+    from episodic_log.providers import get_provider
+    from episodic_log.retrieval.summary_store import SummaryStore
+    from episodic_log.summarizers import build_summarizer
+
+    provider = get_provider(provider_spec)
+    summarizer = build_summarizer(method=method, provider=provider)
+
+    # Phase 1: load all events from all pending sessions.
+    all_session_data: list[tuple[dict, list]] = []
+    for session_meta in tqdm(sessions, desc="Loading logs", unit="session"):
+        summaries_dir = Path(session_meta["summaries_dir"])
+        summary_file = summaries_dir / f"{method}.jsonl"
+        if not overwrite and summary_file.exists() and summary_file.stat().st_size > 0:
+            continue
+        log_path = Path(session_meta["log_path"])
+        if not log_path.exists():
+            logger.warning("log.jsonl missing for %s — skipping.", session_meta["session_id"])
+            continue
+        events = LogReader(log_path).load_all()
+        if not events:
+            logger.warning("Session %s has 0 events — skipping.", session_meta["session_id"])
+            continue
+        all_session_data.append((session_meta, events))
+
+    if not all_session_data:
+        logger.info("vLLM: nothing to summarize.")
+        return
+
+    total_events = sum(len(evs) for _, evs in all_session_data)
+    logger.info(
+        "vLLM mega-batch: %d sessions, %d total events → single LLM.generate() call",
+        len(all_session_data), total_events,
+    )
+
+    # Phase 2: flatten all events and generate all summaries in one shot.
+    all_events_flat = [e for _, evs in all_session_data for e in evs]
+    # Pass batch_size=total_events so vLLM receives all prompts at once.
+    all_summaries = summarizer.summarize_batch(all_events_flat, batch_size=total_events)
+
+    # Phase 3: write summaries back per session.
+    n_written = 0
+    idx = 0
+    for session_meta, events in tqdm(all_session_data, desc="Writing summaries", unit="session"):
+        n = len(events)
+        session_summaries = all_summaries[idx: idx + n]
+        idx += n
+
+        summaries_dir = Path(session_meta["summaries_dir"])
+        summary_file = summaries_dir / f"{method}.jsonl"
+        if summary_file.exists():
+            summary_file.unlink()
+
+        store = SummaryStore(summaries_dir)
+        for summary in session_summaries:
+            try:
+                store.write(summary)
+            except Exception as exc:
+                logger.error(
+                    "Write error: session=%s method=%s: %s",
+                    session_meta["session_id"], method, exc,
+                )
+        n_written += 1
+
+    logger.info("vLLM: done — written=%d sessions, %d total summaries", n_written, total_events)
 
 
 # ---------------------------------------------------------------------------
