@@ -39,8 +39,10 @@ echo "==> Installing episodic-log[hf,groq]"
 pip install -e "${REPO_ROOT}[hf,groq]"
 
 # Extras needed at runtime.
+# scipy is explicitly listed: transformers' loss modules import it and vllm
+# won't pull it in directly, causing ModuleNotFoundError at model load time.
 echo "==> Installing runtime extras"
-pip install huggingface_hub bitsandbytes accelerate rank-bm25 tqdm typer rich
+pip install scipy huggingface_hub bitsandbytes accelerate rank-bm25 tqdm typer rich
 
 echo "==> Installing dev tools"
 pip install pytest ruff
