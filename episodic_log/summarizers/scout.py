@@ -127,7 +127,7 @@ class ScoutSummarizer(AbstractSummarizer):
     def summarize_batch(
         self,
         events: list[TurnEvent],
-        batch_size: int = 8,
+        batch_size: int = 32,
     ) -> list[TurnSummary]:
         """Summarize *events* in batches using a single model.generate() per batch.
 
@@ -139,7 +139,7 @@ class ScoutSummarizer(AbstractSummarizer):
         Args:
             events: All events to summarise (typically one full session).
             batch_size: Number of turns per ``generate_batch`` call. Tune to
-                GPU VRAM; 32 is safe for a 7B model on an 80 GB A100.
+                GPU VRAM; 32 is safe for a 7B model on an 80 GB H100.
 
         Returns:
             List of :class:`TurnSummary` objects in the same order as *events*.

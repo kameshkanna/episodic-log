@@ -127,13 +127,13 @@ class EchoSummarizer(AbstractSummarizer):
     def summarize_batch(
         self,
         events: list[TurnEvent],
-        batch_size: int = 8,
+        batch_size: int = 32,
     ) -> list[TurnSummary]:
         """Summarize *events* in batches using a single model.generate() per batch.
 
         Args:
             events: All events to summarise.
-            batch_size: Turns per ``generate_batch`` call (default 8).
+            batch_size: Turns per ``generate_batch`` call (default 32).
 
         Returns:
             List of :class:`TurnSummary` objects in the same order as *events*.
