@@ -47,9 +47,11 @@ class VLLMProvider(BaseProvider):
         try:
             from vllm import LLM, SamplingParams  # type: ignore[import]
         except ImportError as exc:
-            raise ImportError(
-                "vllm is required. Install with: pip install vllm"
-            ) from exc
+            if "vllm" in str(exc).lower() or "No module named" in str(exc):
+                raise ImportError(
+                    "vllm is required. Install with: pip install vllm"
+                ) from exc
+            raise  # re-raise transitive errors (e.g. scipy/numpy incompatibility) as-is
 
         try:
             from transformers import AutoTokenizer  # type: ignore[import]
