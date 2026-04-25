@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full CHD evaluation pipeline — ingest → summarize → evaluate → judge → score
-# Optimised for 8x H100 SXM5 with HF provider. Total wall time: ~60 min.
+# Optimised for 8x H100 SXM5 with vLLM. Total wall time: ~45 min.
+# Requires clean venv: bash rebuild_venv.sh
 #
 # Usage:
 #   bash run_pipeline.sh
@@ -39,23 +40,21 @@ log "=== STEP 2a: Summarize (lexical, CPU) ==="
 python scripts/summarize.py --method lexical 2>&1 | tee "$LOG_DIR/summarize_lexical.log"
 
 # ---------------------------------------------------------------------------
-# STEP 2b: Scout (GPUs 0-3) + Echo (GPUs 4-7) in parallel — 4 workers each
-#          HF provider, batch_size=32 on H100 80GB → ~15 min total
+# STEP 2b: Scout (GPUs 0-3, tp=4) + Echo (GPUs 4-7, tp=4) in parallel
+#          vLLM mega-batch: 500 sessions → 1 LLM.generate() call → ~5 min each
 # ---------------------------------------------------------------------------
-log "=== STEP 2b: Summarize scout (GPUs 0-3) + echo (GPUs 4-7) in parallel ==="
-
-HF_MODEL="hf:Qwen/Qwen2.5-7B-Instruct"
+log "=== STEP 2b: Summarize scout (GPUs 0-3 vllm:tp4) + echo (GPUs 4-7 vllm:tp4) ==="
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/summarize.py \
     --method scout \
-    --provider "$HF_MODEL" \
-    --num-gpus 4 2>&1 | tee "$LOG_DIR/summarize_scout.log" &
+    --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
+    2>&1 | tee "$LOG_DIR/summarize_scout.log" &
 SCOUT_PID=$!
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/summarize.py \
     --method echo \
-    --provider "$HF_MODEL" \
-    --num-gpus 4 2>&1 | tee "$LOG_DIR/summarize_echo.log" &
+    --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
+    2>&1 | tee "$LOG_DIR/summarize_echo.log" &
 ECHO_PID=$!
 
 wait $SCOUT_PID || { log "ERROR: scout summarizer failed"; exit 1; }
@@ -101,12 +100,12 @@ wait $EVAL3_PID || { log "ERROR: recall/echo eval failed"; exit 1; }
 log "Evaluation complete."
 
 # ---------------------------------------------------------------------------
-# STEP 4: Judge — HF 14B across all 8 GPUs (~20 min)
+# STEP 4: Judge — vLLM tp=8 across all 8 H100s (~5 min)
 # ---------------------------------------------------------------------------
 log "=== STEP 4: Judge ==="
 python scripts/judge.py \
-    --judge-provider "hf:Qwen/Qwen2.5-14B-Instruct" \
-    --num-gpus 8 2>&1 | tee "$LOG_DIR/judge.log"
+    --judge-provider "vllm:Qwen/Qwen2.5-14B-Instruct:tp8" \
+    --num-gpus 1 2>&1 | tee "$LOG_DIR/judge.log"
 log "Judging complete."
 
 # ---------------------------------------------------------------------------
