@@ -112,9 +112,11 @@ def evaluate(
     ] = False,
 ) -> None:
     """Run *condition* on all sessions, parallelised across GPUs."""
-    if condition not in ALL_CONDITIONS:
+    # Build the full registry key: "amnesiac" | "recall/lexical" etc.
+    cond_key = condition if condition == "amnesiac" else f"{condition}/{summary_method}"
+    if cond_key not in ALL_CONDITIONS:
         typer.echo(
-            f"ERROR: Unknown condition {condition!r}. Available: {sorted(ALL_CONDITIONS)}",
+            f"ERROR: Unknown condition {cond_key!r}. Available: {sorted(ALL_CONDITIONS)}",
             err=True,
         )
         raise typer.Exit(1)
@@ -134,7 +136,7 @@ def evaluate(
     model_output_dir = output_dir / slug
     model_output_dir.mkdir(parents=True, exist_ok=True)
 
-    cond_label = condition if condition == "amnesiac" else f"{condition}/{summary_method}"
+    cond_label = cond_key
     output_path = model_output_dir / f"{condition}__{summary_method}.jsonl"
 
     if not overwrite and output_path.exists() and output_path.stat().st_size > 0:
@@ -170,8 +172,9 @@ def evaluate(
     ]
 
     # Each worker writes to a temp shard; main process merges them.
+    shard_stem = cond_key.replace("/", "_")
     shard_paths = [
-        model_output_dir / f".{condition}__{summary_method}__shard{i}.jsonl"
+        model_output_dir / f".{shard_stem}__{summary_method}__shard{i}.jsonl"
         for i in range(num_workers)
     ]
     chunks = _split_sessions(all_sessions, num_workers)
@@ -180,7 +183,7 @@ def evaluate(
         _run_worker(
             cuda_devices=worker_devices[0] if is_hf else None,
             sessions=all_sessions,
-            condition=condition,
+            condition=cond_key,
             summary_method=summary_method,
             provider_spec=provider_spec,
             shard_path=shard_paths[0],
@@ -195,7 +198,7 @@ def evaluate(
                 continue
             p = ctx.Process(
                 target=_run_worker,
-                args=(cuda_devs, chunk, condition, summary_method, provider_spec, shard),
+                args=(cuda_devs, chunk, cond_key, summary_method, provider_spec, shard),
                 name=f"eval-worker{i}",
             )
             p.start()
