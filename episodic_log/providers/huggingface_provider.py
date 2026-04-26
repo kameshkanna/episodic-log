@@ -330,13 +330,23 @@ class HuggingFaceProvider(BaseProvider):
             chat.append({"role": "system", "content": system})
         chat.extend(messages)
 
+        def _apply_template(**kwargs: Any) -> str:
+            """Apply chat template with graceful degradation for unsupported kwargs."""
+            try:
+                return self._tokenizer.apply_chat_template(
+                    chat, tokenize=False, add_generation_prompt=True, **kwargs
+                )
+            except TypeError:
+                # Older tokenizers (e.g. Qwen2.5) don't accept enable_thinking.
+                kwargs.pop("enable_thinking", None)
+                return self._tokenizer.apply_chat_template(
+                    chat, tokenize=False, add_generation_prompt=True, **kwargs
+                )
+
         try:
-            prompt: str = self._tokenizer.apply_chat_template(
-                chat,
-                tools=tools,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            # enable_thinking=False: skip Qwen3's chain-of-thought reasoning so the
+            # agent loop doesn't burn its token budget on <think> blocks per call.
+            prompt: str = _apply_template(tools=tools, enable_thinking=False)
         except Exception as exc:
             logger.warning(
                 "generate_with_tools: apply_chat_template with tools failed (%s); "
@@ -344,11 +354,7 @@ class HuggingFaceProvider(BaseProvider):
                 exc,
             )
             try:
-                prompt = self._tokenizer.apply_chat_template(
-                    chat,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                prompt = _apply_template(enable_thinking=False)
             except Exception:
                 prompt = "\n".join(
                     f"{m['role'].upper()}: {m['content']}" for m in chat
@@ -391,10 +397,14 @@ class HuggingFaceProvider(BaseProvider):
 
         # ------------------------------------------------------------------ #
         # Parse tool call vs. plain text                                       #
+        # Qwen3 prepends <think>...</think> blocks; strip them before parsing  #
+        # so that tool_call detection is not confused by reasoning content.   #
         # ------------------------------------------------------------------ #
+        parse_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+
         tool_call_match = re.search(
             r"<tool_call>\s*(.*?)\s*</tool_call>",
-            raw_text,
+            parse_text,
             re.DOTALL,
         )
         if tool_call_match:
@@ -430,11 +440,13 @@ class HuggingFaceProvider(BaseProvider):
             }
 
         # Plain text response — the model has produced a final answer.
+        # Use parse_text (thinking stripped) as the actual answer content so
+        # downstream components don't receive raw <think> blocks.
         raw_message = {"role": "assistant", "content": raw_text}
-        logger.debug("generate_with_tools: text response len=%d", len(raw_text))
+        logger.debug("generate_with_tools: text response len=%d", len(parse_text))
         return {
             "type": "text",
-            "content": raw_text,
+            "content": parse_text,
             "tool_name": "",
             "tool_args": {},
             "raw_message": raw_message,

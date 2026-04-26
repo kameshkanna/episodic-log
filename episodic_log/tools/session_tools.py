@@ -1,8 +1,19 @@
-"""Factory for session-bound tool callables used by the CHD evaluation agent.
+"""Session-bound tool callables for the CHD evaluation agent.
 
-:func:`make_session_tools` binds :func:`~episodic_log.tools.grep_memory.grep_memory`
-and :func:`~episodic_log.tools.load_turn.load_turn` to a specific session's paths,
-returning ready-to-call functions keyed by their tool names.
+Two retrieval modes — controlled by *mode* in :func:`make_session_tools`:
+
+``"load_only"`` (default, used by RecallCondition)
+    All summaries are injected into the agent's first message.
+    The agent has only ``load_turn`` — it reads the summary index and calls
+    load_turn directly for turns it deems relevant.
+
+``"grep_and_load"`` (used by GrepRecallCondition)
+    Summaries are NOT injected upfront.  The agent has ``grep_memory`` +
+    ``load_turn``.  It must formulate keywords to search, receive matching
+    summary lines, then call load_turn for the relevant ones.
+
+Both modes build the turn map once (O(1) lookup at call time) and format the
+summary block once.  No retrieval library is involved.
 """
 
 from __future__ import annotations
@@ -12,49 +23,80 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
+from episodic_log.core.turn_event import TurnEvent
+from episodic_log.core.turn_summary import TurnSummary
 from episodic_log.tools.grep_memory import GREP_MEMORY_SCHEMA, grep_memory
 from episodic_log.tools.load_turn import LOAD_TURN_SCHEMA, load_turn
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Aggregated tool schemas list (consumed by the agent loop)
-# ---------------------------------------------------------------------------
+# Default schema set — only load_turn (recall condition).
+TOOL_SCHEMAS: list[dict] = [LOAD_TURN_SCHEMA]
 
-TOOL_SCHEMAS: list[dict] = [GREP_MEMORY_SCHEMA, LOAD_TURN_SCHEMA]
+# Extended schema set — grep_memory + load_turn (grep_recall condition).
+GREP_TOOL_SCHEMAS: list[dict] = [GREP_MEMORY_SCHEMA, LOAD_TURN_SCHEMA]
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
+    """Load all turn summaries and return them as a formatted ``[turn_id] text`` block.
+
+    Args:
+        summaries_dir: Directory containing ``<method>.jsonl`` summary files.
+        method: Summarizer method key (e.g. ``"lexical"``, ``"scout"``).
+
+    Returns:
+        Multi-line string, one entry per turn.  Empty string if file missing.
+    """
+    summary_path = summaries_dir / f"{method}.jsonl"
+    if not summary_path.exists():
+        logger.warning("format_summaries_as_context: summary file not found at %s", summary_path)
+        return ""
+
+    lines: list[str] = []
+    with summary_path.open("r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                s = TurnSummary.from_json(stripped)
+                lines.append(f"[{s.turn_id}] {s.summary}")
+            except (KeyError, ValueError) as exc:
+                logger.warning(
+                    "format_summaries_as_context: skipping malformed line %d in %s: %s",
+                    lineno, summary_path, exc,
+                )
+
+    logger.debug(
+        "format_summaries_as_context: %d summaries loaded from %s/%s",
+        len(lines), summaries_dir.name, method,
+    )
+    return "\n".join(lines)
 
 
 def make_session_tools(
     summaries_dir: Path,
     log_path: Path,
     method: str,
-) -> dict[str, Callable]:
-    """Return tool callables bound to the specified session's data paths.
-
-    Each callable in the returned dict accepts only the arguments that the
-    model controls (i.e. the fields defined in the corresponding tool schema).
-    Session-specific arguments (``summaries_dir``, ``log_path``, ``method``)
-    are captured via :func:`functools.partial`.
+    mode: str = "load_only",
+) -> tuple[dict[str, Callable], list[dict]]:
+    """Build session-bound tool callables and the matching tool schema list.
 
     Args:
-        summaries_dir: Path to the directory containing ``<method>.jsonl`` files.
-        log_path: Absolute path to the session's ``log.jsonl`` file.
-        method: Summarizer method name used to select the correct summary file.
+        summaries_dir: Directory containing ``<method>.jsonl`` summary files.
+        log_path: Absolute path to this session's ``log.jsonl``.
+        method: Summarizer method key (e.g. ``"lexical"``).
+        mode: ``"load_only"`` — returns only ``load_turn``.
+              ``"grep_and_load"`` — returns ``grep_memory`` + ``load_turn``.
 
     Returns:
-        Dict mapping tool name strings to bound callables:
-
-        - ``"grep_memory"``: ``(query: str, k: int = 5) -> list[dict[str, str]]``
-        - ``"load_turn"``: ``(turn_id: str) -> str``
+        Tuple of ``(tools_dict, tool_schemas)`` where *tools_dict* maps tool
+        name strings to bound callables and *tool_schemas* is the
+        corresponding list of OpenAI-format schema dicts.
 
     Raises:
-        TypeError: If *summaries_dir* or *log_path* are not :class:`pathlib.Path` objects.
-        ValueError: If *method* is an empty string.
+        TypeError: If *summaries_dir* or *log_path* are not :class:`Path`.
+        ValueError: If *method* is empty or *mode* is unrecognised.
     """
     if not isinstance(summaries_dir, Path):
         raise TypeError(f"summaries_dir must be a Path, got {type(summaries_dir)}")
@@ -62,15 +104,42 @@ def make_session_tools(
         raise TypeError(f"log_path must be a Path, got {type(log_path)}")
     if not method or not isinstance(method, str):
         raise ValueError(f"method must be a non-empty string, got {method!r}")
+    if mode not in ("load_only", "grep_and_load"):
+        raise ValueError(f"mode must be 'load_only' or 'grep_and_load', got {mode!r}")
 
-    logger.debug(
-        "make_session_tools: summaries_dir=%s log_path=%s method=%s",
-        summaries_dir,
-        log_path,
-        method,
+    # ── Build turn map (once per session) ───────────────────────────────────
+    turn_map: dict[str, TurnEvent] = {}
+    if log_path.exists():
+        with log_path.open("r", encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = TurnEvent.from_json(stripped)
+                    turn_map[event.turn_id] = event
+                except (KeyError, ValueError) as exc:
+                    logger.warning(
+                        "make_session_tools: skipping malformed log line %d in %s: %s",
+                        lineno, log_path, exc,
+                    )
+        logger.debug(
+            "make_session_tools: indexed %d turns from %s (mode=%s)",
+            len(turn_map), log_path.name, mode,
+        )
+    else:
+        logger.warning("make_session_tools: log file not found at %s", log_path)
+
+    load_turn_fn = partial(load_turn, turn_map=turn_map)
+
+    if mode == "load_only":
+        return {"load_turn": load_turn_fn}, TOOL_SCHEMAS
+
+    # grep_and_load: pre-load the formatted summary block once, bind to grep_memory.
+    summaries_text = format_summaries_as_context(summaries_dir, method)
+    grep_memory_fn = partial(grep_memory, summaries_text=summaries_text)
+
+    return (
+        {"grep_memory": grep_memory_fn, "load_turn": load_turn_fn},
+        GREP_TOOL_SCHEMAS,
     )
-
-    return {
-        "grep_memory": partial(grep_memory, summaries_dir=summaries_dir, method=method),
-        "load_turn": partial(load_turn, log_path=log_path),
-    }

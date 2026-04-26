@@ -58,21 +58,28 @@ def evaluate(
         str,
         typer.Option(
             "--condition",
-            help=f"Condition name: {', '.join(ALL_CONDITIONS)}.",
+            help="Condition family: amnesiac | recall | topk.",
             case_sensitive=False,
         ),
     ] = "amnesiac",
     provider_spec: Annotated[
         str,
-        typer.Option("--provider", help="Provider spec (e.g. hf:Qwen/Qwen2.5-7B-Instruct)."),
+        typer.Option("--provider", help="Provider spec (e.g. hf:Qwen/Qwen3-72B)."),
     ] = "groq:llama-3.1-8b-instant",
     summary_method: Annotated[
         str,
         typer.Option(
             "--summary-method",
-            help="Summary index to use for recall conditions: lexical | scout | echo.",
+            help="Summary index to use for recall/topk conditions: lexical | scout | echo.",
         ),
     ] = "lexical",
+    retrieval_k: Annotated[
+        int,
+        typer.Option(
+            "--retrieval-k",
+            help="Top-k turns to inject for topk condition (3 | 5 | 10).",
+        ),
+    ] = 5,
     n: Annotated[
         int | None,
         typer.Option("--n", help="Limit to first N sessions (default: all)."),
@@ -112,8 +119,14 @@ def evaluate(
     ] = False,
 ) -> None:
     """Run *condition* on all sessions, parallelised across GPUs."""
-    # Build the full registry key: "amnesiac" | "recall/lexical" etc.
-    cond_key = condition if condition == "amnesiac" else f"{condition}/{summary_method}"
+    # Build the full registry key:
+    #   "amnesiac" | "recall/lexical" | "topk/lexical/k5" etc.
+    if condition == "amnesiac":
+        cond_key = "amnesiac"
+    elif condition == "topk":
+        cond_key = f"topk/{summary_method}/k{retrieval_k}"
+    else:
+        cond_key = f"{condition}/{summary_method}"
     if cond_key not in ALL_CONDITIONS:
         typer.echo(
             f"ERROR: Unknown condition {cond_key!r}. Available: {sorted(ALL_CONDITIONS)}",
@@ -137,7 +150,10 @@ def evaluate(
     model_output_dir.mkdir(parents=True, exist_ok=True)
 
     cond_label = cond_key
-    output_path = model_output_dir / f"{condition}__{summary_method}.jsonl"
+    # Use the full cond_key (slashes → double-underscore) as the filename so
+    # different k values don't overwrite each other.
+    output_stem = cond_key.replace("/", "__")
+    output_path = model_output_dir / f"{output_stem}.jsonl"
 
     if not overwrite and output_path.exists() and output_path.stat().st_size > 0:
         typer.echo(f"Already complete: {output_path}. Use --overwrite to re-run.")

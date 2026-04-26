@@ -1,9 +1,9 @@
 """Tool-use agent loop for the CHD (Conversational Hallucination Drift) evaluation.
 
-:class:`AgentLoop` drives a model through an iterative tool-calling cycle:
-the model calls ``grep_memory`` to search a session's summary index, then
-``load_turn`` to read verbatim turn content, until it has enough information
-to produce a final answer.
+Design: no retrieval layer.  The agent receives the full 1-2 line summary of
+every turn in the session in its first message.  It reads those summaries,
+decides which turns are relevant, then calls ``load_turn`` to read the full
+verbatim content from ``log.jsonl`` before producing a final answer.
 """
 
 from __future__ import annotations
@@ -15,32 +15,50 @@ from typing import Any
 
 from episodic_log.agent.trace import AgentTrace, ToolCallRecord
 from episodic_log.providers.base import BaseProvider
-from episodic_log.tools.session_tools import TOOL_SCHEMAS, make_session_tools
+from episodic_log.tools.session_tools import format_summaries_as_context, make_session_tools
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT: str = (
-    "You are an AI assistant with access to a memory index of past conversations.\n"
-    "Use grep_memory to search for relevant turns, then load_turn to read their full content.\n"
-    "You may call tools multiple times. Once you have enough information, give a direct answer.\n"
-    "Do not call tools if you already have the answer."
+_SYSTEM_PROMPT_LOAD_ONLY: str = (
+    "You are answering a question about a past conversation.\n"
+    "The memory index in the user message lists every turn with a one-line summary.\n\n"
+    "Instructions:\n"
+    "1. Read the memory index and identify which turns are relevant to the question.\n"
+    "2. Call load_turn for each relevant turn to read its full verbatim content.\n"
+    "3. Answer ONLY after reading the supporting turns.\n"
+    "4. If the answer spans multiple turns, load all of them.\n"
+    "5. If nothing in the index is relevant, say so explicitly — do NOT guess."
 )
+
+_SYSTEM_PROMPT_GREP: str = (
+    "You are answering a question about a past conversation.\n"
+    "You have two tools: grep_memory to search turn summaries, and load_turn to read full turns.\n\n"
+    "Instructions:\n"
+    "1. Think about what keywords would appear in a summary of the relevant turn.\n"
+    "2. Call grep_memory with those keywords to find candidate turns.\n"
+    "3. If the first search misses, try different keywords or synonyms.\n"
+    "4. Call load_turn on turns that look relevant from their summary.\n"
+    "5. Answer ONLY after reading the verbatim turn content.\n"
+    "6. Do NOT guess — if you cannot find the answer after searching, say so."
+)
+
+# Default — overridden per-call based on mode.
+SYSTEM_PROMPT = _SYSTEM_PROMPT_LOAD_ONLY
 
 
 class AgentLoop:
-    """Runs the tool-use agent loop: model calls tools until it produces a final answer.
+    """Runs the tool-use agent loop: model reads summary index, loads turns, answers.
 
     The loop operates as follows:
 
-    1. Build session-bound tool callables via :func:`~episodic_log.tools.session_tools.make_session_tools`.
+    1. Format all turn summaries as a text block and inject into the first message.
     2. Inject the system prompt.
-    3. Start the conversation with the user's question.
+    3. The model reads the summary index, then calls ``load_turn`` for relevant turns.
     4. Repeat up to *max_tool_calls* times:
 
        a. Call :meth:`~episodic_log.providers.base.BaseProvider.generate_with_tools`.
        b. If the response is a final text answer, break.
-       c. If the response is a tool call, execute the tool, append both the
-          assistant tool-call message and the tool-result message, then continue.
+       c. If the response is a ``load_turn`` call, execute it, append result, continue.
 
     5. If the budget is exhausted without a text answer, force one via
        :meth:`~episodic_log.providers.base.BaseProvider.generate`.
@@ -48,8 +66,8 @@ class AgentLoop:
 
     Args:
         provider: An instantiated :class:`~episodic_log.providers.base.BaseProvider`.
-        max_tool_calls: Maximum number of tool invocations before forcing a final answer.
-            Defaults to 8.
+        max_tool_calls: Maximum ``load_turn`` calls before forcing a final answer.
+            Defaults to 15.
 
     Raises:
         TypeError: If *provider* is not a BaseProvider instance.
@@ -59,7 +77,8 @@ class AgentLoop:
     def __init__(
         self,
         provider: BaseProvider,
-        max_tool_calls: int = 8,
+        max_tool_calls: int = 15,
+        mode: str = "load_only",
     ) -> None:
         if not isinstance(provider, BaseProvider):
             raise TypeError(
@@ -69,8 +88,11 @@ class AgentLoop:
             raise ValueError(
                 f"max_tool_calls must be a positive integer, got {max_tool_calls!r}"
             )
+        if mode not in ("load_only", "grep_and_load"):
+            raise ValueError(f"mode must be 'load_only' or 'grep_and_load', got {mode!r}")
         self._provider = provider
         self._max_tool_calls = max_tool_calls
+        self._mode = mode
 
     def run(
         self,
@@ -82,24 +104,16 @@ class AgentLoop:
 
         Args:
             question: The question to answer using the session's memory.
-            session_meta: Mapping that must contain:
-
-                - ``"session_id"`` (``str``): Session identifier.
-                - ``"log_path"`` (``str | Path``): Path to ``log.jsonl``.
-                - ``"summaries_dir"`` (``str | Path``): Path to the summaries directory.
-
+            session_meta: Mapping that must contain ``"session_id"``,
+                ``"log_path"``, and ``"summaries_dir"``.
             summary_method: Summarizer method key used to load the correct
-                ``<method>.jsonl`` file (e.g. ``"lexical"``, ``"scout"``,
-                ``"echo"``).
+                ``<method>.jsonl`` summary file.
 
         Returns:
-            A :class:`~episodic_log.agent.trace.AgentTrace` with the question,
-            final answer, all tool call records, and metadata.
+            A :class:`~episodic_log.agent.trace.AgentTrace`.
 
         Raises:
             TypeError: If *question* is not a string or *session_meta* is not a dict.
-            ValueError: If required keys are missing from *session_meta* or
-                *summary_method* is empty.
             KeyError: If *session_meta* is missing required keys.
         """
         if not isinstance(question, str):
@@ -109,8 +123,7 @@ class AgentLoop:
         if not summary_method or not isinstance(summary_method, str):
             raise ValueError(f"summary_method must be a non-empty string, got {summary_method!r}")
 
-        _required_keys = ("session_id", "log_path", "summaries_dir")
-        for key in _required_keys:
+        for key in ("session_id", "log_path", "summaries_dir"):
             if key not in session_meta:
                 raise KeyError(f"session_meta is missing required key: '{key}'")
 
@@ -118,52 +131,67 @@ class AgentLoop:
         log_path = Path(session_meta["log_path"])
         summaries_dir = Path(session_meta["summaries_dir"])
 
-        tools = make_session_tools(
+        tools, tool_schemas = make_session_tools(
             summaries_dir=summaries_dir,
             log_path=log_path,
             method=summary_method,
+            mode=self._mode,
         )
+
+        # Build the first user message depending on mode.
+        if self._mode == "load_only":
+            # Dump all summaries upfront — model reads and calls load_turn.
+            summary_context = format_summaries_as_context(summaries_dir, summary_method)
+            if summary_context:
+                first_message = (
+                    f"Memory index ({summary_context.count(chr(10)) + 1} turns):\n"
+                    f"{summary_context}\n\n"
+                    f"Question: {question}"
+                )
+            else:
+                first_message = f"No memory index available.\n\nQuestion: {question}"
+        else:
+            # grep_and_load — model receives only the question and must search.
+            first_message = question
 
         logger.info(
-            "AgentLoop.run: session_id=%s method=%s question=%r",
-            session_id,
-            summary_method,
-            question,
+            "AgentLoop.run: session_id=%s method=%s mode=%s question=%r",
+            session_id, summary_method, self._mode, question,
         )
 
-        # Mutable state accumulated over the loop.
+        system_prompt = (
+            _SYSTEM_PROMPT_GREP if self._mode == "grep_and_load"
+            else _SYSTEM_PROMPT_LOAD_ONLY
+        )
+
         tool_call_records: list[ToolCallRecord] = []
         turns_loaded: list[str] = []
-        messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
+        messages: list[dict[str, Any]] = [{"role": "user", "content": first_message}]
         final_answer: str = ""
 
         for step in range(self._max_tool_calls):
             logger.debug("AgentLoop.run: step=%d/%d", step + 1, self._max_tool_calls)
-
             result = self._provider.generate_with_tools(
                 messages=messages,
-                tools=TOOL_SCHEMAS,
-                system=SYSTEM_PROMPT,
+                tools=tool_schemas,
+                system=system_prompt,
+                max_tokens=1024,
             )
 
             if result["type"] == "text":
                 final_answer = result["content"]
                 logger.info(
-                    "AgentLoop.run: final answer received at step=%d len=%d",
-                    step + 1,
-                    len(final_answer),
+                    "AgentLoop.run: final answer at step=%d len=%d",
+                    step + 1, len(final_answer),
                 )
                 break
 
-            # Tool call branch.
             tool_name: str = result["tool_name"]
             tool_args: dict[str, Any] = result["tool_args"]
             raw_message: dict[str, Any] = result["raw_message"]
 
-            # Append the assistant's tool-call message to history.
             messages.append(raw_message)
 
-            # Execute the tool.
             tool_result: str = self._call_tool(tool_name, tool_args, tools)
             call_ts = datetime.now(tz=timezone.utc)
 
@@ -176,29 +204,22 @@ class AgentLoop:
                 )
             )
 
-            # Track which turns were loaded for downstream analysis.
             if tool_name == "load_turn" and "turn_id" in tool_args:
                 turns_loaded.append(str(tool_args["turn_id"]))
 
-            # Append the tool result in Qwen's native tool-result format.
             messages.append(
                 {"role": "tool", "content": tool_result, "name": tool_name}
             )
-            logger.debug(
-                "AgentLoop.run: tool=%s result_len=%d", tool_name, len(tool_result)
-            )
         else:
-            # Budget exhausted — force a final answer from the model.
             logger.warning(
                 "AgentLoop.run: max_tool_calls=%d exhausted for session=%s — forcing answer.",
-                self._max_tool_calls,
-                session_id,
+                self._max_tool_calls, session_id,
             )
-            forced_prompt = f"Based on what you found, answer now: {question}"
+            forced_prompt = f"Based on the turns you loaded, answer now: {question}"
             messages.append({"role": "user", "content": forced_prompt})
             final_answer = self._provider.generate(
                 messages=messages,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
             )
 
         return AgentTrace(
@@ -211,47 +232,22 @@ class AgentLoop:
             summary_method=summary_method,
         )
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
     def _call_tool(
         self,
         tool_name: str,
         tool_args: dict[str, Any],
         tools: dict[str, Any],
     ) -> str:
-        """Dispatch a tool call by name and return the result as a string.
-
-        Args:
-            tool_name: Name of the tool to call.
-            tool_args: Argument dict to pass to the tool callable.
-            tools: Dict mapping tool names to bound callables.
-
-        Returns:
-            Tool output coerced to a string.  If the callable raises, the
-            exception message is returned instead so the model can observe the
-            error and adjust its next call.
-        """
         if tool_name not in tools:
-            msg = (
+            return (
                 f"Unknown tool '{tool_name}'. "
                 f"Available tools: {list(tools.keys())}"
             )
-            logger.warning("AgentLoop._call_tool: %s", msg)
-            return msg
-
-        callable_ = tools[tool_name]
         try:
-            raw_result = callable_(**tool_args)
-            result_str = str(raw_result)
+            return str(tools[tool_name](**tool_args))
         except (TypeError, ValueError, FileNotFoundError) as exc:
             logger.warning(
                 "AgentLoop._call_tool: tool=%s raised %s: %s",
-                tool_name,
-                type(exc).__name__,
-                exc,
+                tool_name, type(exc).__name__, exc,
             )
-            result_str = f"Error calling {tool_name}: {exc}"
-
-        return result_str
+            return f"Error calling {tool_name}: {exc}"

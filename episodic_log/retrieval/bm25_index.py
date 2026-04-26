@@ -72,6 +72,27 @@ class BM25Index:
 
         Returns:
             Ordered list (most relevant first) of zero-padded turn_id strings.
+            Zero-score results (complete keyword misses) are excluded.
+
+        Raises:
+            TypeError: If *text* is not a string.
+            ValueError: If *k* is not a positive integer.
+        """
+        return [turn_id for turn_id, _ in self.query_with_scores(text, k=k)]
+
+    def query_with_scores(self, text: str, k: int = 5) -> list[tuple[str, float]]:
+        """Retrieve the top-k most relevant (turn_id, score) pairs.
+
+        Zero-score results are filtered out so the caller can distinguish a
+        genuine miss from a low-scoring match.
+
+        Args:
+            text: Free-text query.
+            k: Maximum number of results to return.
+
+        Returns:
+            Ordered list of ``(turn_id, score)`` tuples, most relevant first.
+            Empty if no document matched any query token.
 
         Raises:
             TypeError: If *text* is not a string.
@@ -90,10 +111,13 @@ class BM25Index:
         else:
             scores = self._naive_tf_scores(tokens)
 
-        # argsort descending — pick top k_clamped
         import heapq
         top_indices = heapq.nlargest(k_clamped, range(len(scores)), key=lambda i: scores[i])
-        return [self._turn_ids[i] for i in top_indices]
+        return [
+            (self._turn_ids[i], float(scores[i]))
+            for i in top_indices
+            if scores[i] > 0
+        ]
 
     # ------------------------------------------------------------------
     # Private

@@ -1,16 +1,20 @@
-"""BM25-based memory search tool for the CHD evaluation agent.
+"""Keyword grep tool for the CHD evaluation agent.
 
-Reads a ``<method>.jsonl`` summary file and returns the top-k most relevant
-turns for a free-text query using :class:`~episodic_log.retrieval.bm25_index.BM25Index`.
+The model generates its own search keywords based on the question, then calls
+this tool to find matching summary lines.  Matching is simple case-insensitive
+substring search — no scoring, no ranking.  Every summary line that contains
+any of the query words is returned.
+
+This is intentionally different from BM25:
+  - BM25 scores every document using TF-IDF weighting and the raw question.
+  - This tool returns all lines matching model-chosen keywords (binary match).
+  - The model decides WHAT to search for; the system just does the grep.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-
-from episodic_log.core.turn_summary import TurnSummary
-from episodic_log.retrieval.bm25_index import BM25Index
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -23,26 +27,35 @@ GREP_MEMORY_SCHEMA: dict = {
     "function": {
         "name": "grep_memory",
         "description": (
-            "Search your memory index for turns relevant to a query. "
-            "Returns up to k matching turns with their IDs and summaries."
+            "Search the memory index for turns matching your keywords. "
+            "Returns all summary lines that contain any of the keywords. "
+            "Choose specific keywords that would appear in a summary of the relevant turn. "
+            "Call load_turn with a turn_id to read the full content."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
+                "keywords": {
                     "type": "string",
-                    "description": "Keywords or phrase to search for",
+                    "description": (
+                        "Space-separated keywords to search for "
+                        "(e.g. 'dentist appointment Tuesday'). "
+                        "Use specific nouns, names, dates, or action words."
+                    ),
                 },
-                "k": {
+                "max_results": {
                     "type": "integer",
-                    "description": "Max results to return",
-                    "default": 5,
+                    "description": "Maximum number of matching lines to return (default 20).",
+                    "default": 20,
                 },
             },
-            "required": ["query"],
+            "required": ["keywords"],
         },
     },
 }
+
+_MIN_KEYWORD_LEN = 3  # ignore very short words like "a", "is", "to"
+_WORD_RE = re.compile(r"\b\w+\b")
 
 
 # ---------------------------------------------------------------------------
@@ -51,82 +64,71 @@ GREP_MEMORY_SCHEMA: dict = {
 
 
 def grep_memory(
-    query: str,
-    summaries_dir: Path,
-    method: str,
-    k: int = 5,
-) -> list[dict[str, str]]:
-    """Search the BM25 summary index and return the top-k matching turns.
-
-    Reads ``<summaries_dir>/<method>.jsonl``, builds a
-    :class:`~episodic_log.retrieval.bm25_index.BM25Index` over all summaries,
-    and returns the top-k results ordered by relevance.
+    keywords: str,
+    summaries_text: str,
+    max_results: int = 20,
+) -> str:
+    """Return all summary lines containing any of the given keywords.
 
     Args:
-        query: Free-text search string.
-        summaries_dir: Path to the directory containing ``<method>.jsonl`` files.
-        method: Summarizer method name (e.g. ``"lexical"``, ``"scout"``, ``"echo"``).
-        k: Maximum number of results to return.  Defaults to 5.
+        keywords: Space-separated search terms chosen by the model.
+        summaries_text: The full pre-formatted summary block, one line per turn
+            in the format ``[turn_id] summary text``.
+        max_results: Maximum lines to return.
 
     Returns:
-        List of dicts, each with keys ``"turn_id"`` and ``"summary"``,
-        ordered from most to least relevant.  Returns an empty list if the
-        summary file is missing or contains no parseable entries.
+        A formatted string listing matching summary lines, or a "no match"
+        message with a suggestion to try different keywords.
 
     Raises:
-        TypeError: If *query* is not a string or *summaries_dir* is not a Path.
-        ValueError: If *k* is not a positive integer.
+        TypeError: If *keywords* is not a string.
+        ValueError: If *max_results* is not a positive integer.
     """
-    if not isinstance(query, str):
-        raise TypeError(f"query must be a str, got {type(query)}")
-    if not isinstance(summaries_dir, Path):
-        raise TypeError(f"summaries_dir must be a Path, got {type(summaries_dir)}")
-    if not isinstance(k, int) or k <= 0:
-        raise ValueError(f"k must be a positive integer, got {k!r}")
+    if not isinstance(keywords, str):
+        raise TypeError(f"keywords must be a str, got {type(keywords)}")
+    if not isinstance(max_results, int) or max_results <= 0:
+        raise ValueError(f"max_results must be a positive integer, got {max_results!r}")
 
-    summary_path = summaries_dir / f"{method}.jsonl"
-    if not summary_path.exists():
-        logger.warning(
-            "grep_memory: summary file not found at %s — returning empty results.",
-            summary_path,
+    if not summaries_text:
+        return "No memory index available for this session."
+
+    # Extract meaningful keywords (skip very short stop-words).
+    kws = [
+        w.lower()
+        for w in _WORD_RE.findall(keywords)
+        if len(w) >= _MIN_KEYWORD_LEN
+    ]
+    if not kws:
+        return (
+            f"No usable keywords in {keywords!r} (all words are too short). "
+            "Use specific nouns or action words."
         )
-        return []
 
-    summaries: list[TurnSummary] = []
-    with summary_path.open("r", encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                summaries.append(TurnSummary.from_json(stripped))
-            except (KeyError, ValueError) as exc:
-                logger.warning(
-                    "grep_memory: skipping malformed line %d in %s: %s",
-                    lineno,
-                    summary_path,
-                    exc,
-                )
+    lines = summaries_text.splitlines()
+    matches = [
+        line for line in lines
+        if any(kw in line.lower() for kw in kws)
+    ]
 
-    if not summaries:
-        logger.warning(
-            "grep_memory: summary file %s is empty or has no parseable entries.",
-            summary_path,
+    if not matches:
+        return (
+            f"No turns matched keywords {kws}. "
+            "Try synonyms, a shorter keyword, or a different aspect of the question."
         )
-        return []
 
-    index = BM25Index(summaries)
-    top_ids: list[str] = index.query(query, k=k)
-
-    # Build a lookup map for O(1) access when assembling results.
-    summary_by_id: dict[str, str] = {s.turn_id: s.summary for s in summaries}
-
-    results: list[dict[str, str]] = []
-    for turn_id in top_ids:
-        if turn_id in summary_by_id:
-            results.append({"turn_id": turn_id, "summary": summary_by_id[turn_id]})
+    results = matches[:max_results]
+    truncation_note = (
+        f"\n(showing {max_results} of {len(matches)} matches — "
+        "refine keywords to narrow results)"
+        if len(matches) > max_results else ""
+    )
 
     logger.debug(
-        "grep_memory: query=%r method=%s returned %d results.", query, method, len(results)
+        "grep_memory: keywords=%r matched %d/%d lines.", keywords, len(matches), len(lines)
     )
-    return results
+    return (
+        f"grep_memory: {len(results)} matching turn(s) for '{keywords}':\n\n"
+        + "\n".join(results)
+        + truncation_note
+        + "\n\nCall load_turn(turn_id) to read the full content of any turn."
+    )

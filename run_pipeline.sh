@@ -67,30 +67,30 @@ log "Summarization complete."
 # ---------------------------------------------------------------------------
 log "=== STEP 3: Evaluate (4 conditions × 2 GPUs, hf provider) ==="
 
-HF_MODEL="hf:Qwen/Qwen2.5-7B-Instruct"
+HF_MODEL="hf:Qwen/Qwen3-72B"
 
 CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
     --condition amnesiac \
     --provider "$HF_MODEL" \
-    --num-gpus 2 2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
+    --num-gpus 2 --gpus-per-worker 2 2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
 EVAL0_PID=$!
 
 CUDA_VISIBLE_DEVICES=2,3 python scripts/evaluate.py \
     --condition recall --summary-method lexical \
     --provider "$HF_MODEL" \
-    --num-gpus 2 2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
+    --num-gpus 2 --gpus-per-worker 2 2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
 EVAL1_PID=$!
 
 CUDA_VISIBLE_DEVICES=4,5 python scripts/evaluate.py \
     --condition recall --summary-method scout \
     --provider "$HF_MODEL" \
-    --num-gpus 2 2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
+    --num-gpus 2 --gpus-per-worker 2 2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
 EVAL2_PID=$!
 
 CUDA_VISIBLE_DEVICES=6,7 python scripts/evaluate.py \
     --condition recall --summary-method echo \
     --provider "$HF_MODEL" \
-    --num-gpus 2 2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
+    --num-gpus 2 --gpus-per-worker 2 2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
 EVAL3_PID=$!
 
 wait $EVAL0_PID || { log "ERROR: amnesiac eval failed"; exit 1; }

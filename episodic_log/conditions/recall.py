@@ -1,4 +1,4 @@
-"""Recall condition — tool-use memory via grep_memory + load_turn agent loop."""
+"""Recall condition — summary dump + load_turn agent loop."""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ _REQUIRED_META_KEYS: frozenset[str] = frozenset(
 
 
 class RecallCondition(BaseCondition):
-    """Tool-use memory condition using a summarised index.
+    """Memory condition: all turn summaries are dumped into the context, model calls load_turn.
 
-    The model is given access to two tools — ``grep_memory`` (BM25 search over
-    a pre-built summary index) and ``load_turn`` (load a raw conversation turn
-    by ID) — and must answer the question by retrieving relevant evidence from
-    the session log.
+    All 1-2 line summaries for the session are injected into the first user
+    message.  The model reads the summary index, identifies relevant turns by
+    their IDs, and calls ``load_turn`` to read the full verbatim content from
+    ``log.jsonl`` before answering.  No retrieval system is involved — the model
+    does the "search" by reading the summary block.
 
     The summary index is constructed from one of three summariser variants,
     controlled by *summary_method*.
@@ -30,14 +31,14 @@ class RecallCondition(BaseCondition):
     Args:
         summary_method: Index construction strategy; one of ``"lexical"``,
             ``"scout"``, or ``"echo"``.
-        max_tool_calls: Upper bound on the number of tool invocations the agent
-            loop is allowed per question.  Defaults to 8.
+        max_tool_calls: Upper bound on load_turn calls the agent loop is allowed
+            per question.  Defaults to 15.
 
     Raises:
         ValueError: If *summary_method* is not one of the accepted values.
     """
 
-    def __init__(self, summary_method: str, max_tool_calls: int = 8) -> None:
+    def __init__(self, summary_method: str, max_tool_calls: int = 15) -> None:
         if summary_method not in _VALID_SUMMARY_METHODS:
             raise ValueError(
                 f"summary_method must be one of {sorted(_VALID_SUMMARY_METHODS)}, "

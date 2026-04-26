@@ -1,15 +1,17 @@
 """Full-turn loader tool for the CHD evaluation agent.
 
-Scans ``log.jsonl`` for a specific turn by ID and returns a formatted
-string representation suitable for inclusion in the agent's context window.
+Performs an O(1) lookup in a pre-built ``turn_id → TurnEvent`` dict built by
+:func:`~episodic_log.tools.session_tools.make_session_tools`.  No linear
+file scan occurs at call time.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from episodic_log.core.turn_event import TurnEvent
+if TYPE_CHECKING:
+    from episodic_log.core.turn_event import TurnEvent
 
 logger = logging.getLogger(__name__)
 
@@ -22,15 +24,15 @@ LOAD_TURN_SCHEMA: dict = {
     "function": {
         "name": "load_turn",
         "description": (
-            "Load the full content of a specific conversation turn by its ID. "
-            "Returns the verbatim turn text including role and content."
+            "Load the full verbatim content of a conversation turn by its ID. "
+            "Use grep_memory first to find relevant turn IDs."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "turn_id": {
                     "type": "string",
-                    "description": "Zero-padded turn identifier (e.g. '0042')",
+                    "description": "Turn identifier returned by grep_memory (e.g. '0042')",
                 },
             },
             "required": ["turn_id"],
@@ -44,15 +46,17 @@ LOAD_TURN_SCHEMA: dict = {
 # ---------------------------------------------------------------------------
 
 
-def load_turn(turn_id: str, log_path: Path) -> str:
-    """Scan ``log.jsonl`` and return the formatted content of the requested turn.
-
-    Reads the log file line-by-line (streaming) so that arbitrarily large logs
-    are handled without loading the entire file into memory.
+def load_turn(
+    turn_id: str,
+    turn_map: "dict[str, TurnEvent]",
+) -> str:
+    """Return the formatted content of a turn via O(1) dict lookup.
 
     Args:
-        turn_id: Zero-padded string identifier for the turn (e.g. ``"0042"``).
-        log_path: Absolute path to the ``log.jsonl`` file for this session.
+        turn_id: String identifier for the turn (e.g. ``"0042"``).
+        turn_map: Pre-built mapping from turn_id strings to
+            :class:`~episodic_log.core.turn_event.TurnEvent` objects,
+            constructed in :func:`~episodic_log.tools.session_tools.make_session_tools`.
 
     Returns:
         A human-readable string in the format::
@@ -60,44 +64,29 @@ def load_turn(turn_id: str, log_path: Path) -> str:
             [ROLE | turn XXXX]
             Content: <verbatim turn content>
 
-        If the turn is not found, returns ``"Turn {turn_id} not found."``.
+        Returns ``"Turn {turn_id} not found."`` if the ID is not in the map.
 
     Raises:
-        TypeError: If *turn_id* is not a string or *log_path* is not a Path.
-        FileNotFoundError: If *log_path* does not exist.
+        TypeError: If *turn_id* is not a string.
     """
     if not isinstance(turn_id, str):
         raise TypeError(f"turn_id must be a str, got {type(turn_id)}")
-    if not isinstance(log_path, Path):
-        raise TypeError(f"log_path must be a Path, got {type(log_path)}")
-    if not log_path.exists():
-        raise FileNotFoundError(f"Log file not found: {log_path}")
 
-    with log_path.open("r", encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                event: TurnEvent = TurnEvent.from_json(stripped)
-            except (KeyError, ValueError) as exc:
-                logger.warning(
-                    "load_turn: skipping malformed line %d in %s: %s",
-                    lineno,
-                    log_path,
-                    exc,
-                )
-                continue
+    # Normalise: strip whitespace and leading zeros are preserved as-is since
+    # turn_ids are zero-padded strings (e.g. "0042" not "42").
+    turn_id = turn_id.strip()
 
-            if event.turn_id == turn_id:
-                role_label = event.role.value.upper()
-                formatted = f"[{role_label} | turn {event.turn_id}]\nContent: {event.content}"
-                if event.tool_name:
-                    formatted += f"\nTool: {event.tool_name}"
-                if event.file_path:
-                    formatted += f"\nFile: {event.file_path}"
-                logger.debug("load_turn: found turn_id=%s at line %d.", turn_id, lineno)
-                return formatted
+    event = turn_map.get(turn_id)
+    if event is None:
+        logger.warning("load_turn: turn_id=%r not found in turn_map.", turn_id)
+        return f"Turn {turn_id} not found. Check the turn_id from grep_memory results."
 
-    logger.warning("load_turn: turn_id=%s not found in %s.", turn_id, log_path)
-    return f"Turn {turn_id} not found."
+    role_label = event.role.value.upper()
+    formatted = f"[{role_label} | turn {event.turn_id}]\nContent: {event.content}"
+    if event.tool_name:
+        formatted += f"\nTool: {event.tool_name}"
+    if event.file_path:
+        formatted += f"\nFile: {event.file_path}"
+
+    logger.debug("load_turn: found turn_id=%r", turn_id)
+    return formatted

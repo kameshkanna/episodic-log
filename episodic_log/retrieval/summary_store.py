@@ -1,10 +1,11 @@
-"""SummaryStore — loads TurnSummary JSONL files and provides BM25 retrieval.
+"""SummaryStore — append-write and lazy-load for TurnSummary JSONL files.
 
 Each summarizer method writes its output to a separate JSONL file:
     <summaries_dir>/<method>.jsonl
 
-SummaryStore loads all files in *summaries_dir* on demand and caches a
-per-method :class:`~episodic_log.retrieval.bm25_index.BM25Index`.
+SummaryStore is used by summarize.py to persist summaries and, on demand,
+can build a :class:`~episodic_log.retrieval.bm25_index.BM25Index` for
+optional BM25 retrieval (not used by the current evaluation conditions).
 """
 
 from __future__ import annotations
@@ -19,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class SummaryStore:
-    """Lazy-loading store of :class:`~episodic_log.core.turn_summary.TurnSummary` records.
+    """Write-and-load store for :class:`~episodic_log.core.turn_summary.TurnSummary` records.
 
-    The store reads ``<summaries_dir>/<method>.jsonl`` files on first access and
-    caches a :class:`~episodic_log.retrieval.bm25_index.BM25Index` per method.
+    Used by ``summarize.py`` to append summaries during ingestion.  Also provides
+    lazy-loading and optional BM25 index building for offline analysis.
 
     Args:
         summaries_dir: Directory containing ``<method>.jsonl`` summary files.
@@ -70,7 +71,7 @@ class SummaryStore:
         Results are cached in memory; call :meth:`invalidate` to force a reload.
 
         Args:
-            method: Summarizer method name (e.g. ``"structured"``, ``"haiku"``, ``"self"``).
+            method: Summarizer method name (e.g. ``"lexical"``, ``"scout"``, ``"echo"``).
 
         Returns:
             Ordered list of :class:`~episodic_log.core.turn_summary.TurnSummary` records.

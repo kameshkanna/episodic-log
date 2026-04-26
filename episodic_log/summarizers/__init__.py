@@ -1,7 +1,7 @@
 """Summarizer implementations and factory for the episodic log system.
 
 All summarizers produce :class:`~episodic_log.core.turn_summary.TurnSummary` records
-used exclusively as a BM25 search index.  The agent never reads summaries directly.
+consumed by memory conditions (recall, grep_recall, topk).
 
 Exported names
 --------------

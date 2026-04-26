@@ -1,9 +1,9 @@
 """Abstract base class for all TurnEvent summarizers.
 
 Summarizers generate one-line :class:`~episodic_log.core.turn_summary.TurnSummary`
-records that are stored as a BM25 search index.  The agent never reads summaries
-directly — it always retrieves verbatim :class:`~episodic_log.core.turn_event.TurnEvent`
-records from ``log.jsonl``.
+records stored in ``<summaries_dir>/<method>.jsonl``.  These are used by memory
+conditions — either dumped in full into the agent's context (recall conditions)
+or searched via keyword grep (grep_recall) or keyword-overlap scoring (topk).
 """
 
 from __future__ import annotations
@@ -17,9 +17,10 @@ from episodic_log.core.turn_summary import TurnSummary
 class AbstractSummarizer(ABC):
     """Generates a one-line summary for a :class:`~episodic_log.core.turn_event.TurnEvent`.
 
-    Summaries are stored as ``{summary, turn_id}`` JSONL records and used
-    exclusively as a BM25 search index.  The agent never sees summaries —
-    it sees verbatim TurnEvent records retrieved from ``log.jsonl``.
+    Summaries are stored as ``{summary, turn_id}`` JSONL records consumed by
+    memory conditions.  In recall conditions, all summaries are injected into
+    the agent's first message.  In grep_recall, the agent searches them by
+    keyword.  In topk, the top-k by keyword overlap are pre-loaded verbatim.
 
     Concrete subclasses must implement :attr:`method` and :meth:`summarize`.
     """
@@ -29,7 +30,7 @@ class AbstractSummarizer(ABC):
     def method(self) -> str:
         """Identifier for this summarization strategy.
 
-        Expected values: ``"structured"`` | ``"haiku"`` | ``"self"``.
+        Expected values: ``"lexical"`` | ``"scout"`` | ``"echo"``.
         Used as the ``method`` field in every :class:`~episodic_log.core.turn_summary.TurnSummary`
         this summarizer produces and as the JSONL output file name stem.
 

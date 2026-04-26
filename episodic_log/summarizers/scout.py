@@ -4,8 +4,8 @@ Uses a small language model (via any :class:`~episodic_log.providers.base.BasePr
 implementation) to write 1-2 sentence summaries of
 :class:`~episodic_log.core.turn_event.TurnEvent` records.
 
-Summaries are consumed exclusively by the BM25 search index and are never
-shown directly to the agent.
+Summaries are consumed by memory conditions: dumped in full for recall,
+searched by keyword for grep_recall, and pre-loaded top-k for topk.
 """
 
 from __future__ import annotations

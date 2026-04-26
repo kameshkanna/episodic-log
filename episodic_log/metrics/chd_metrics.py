@@ -113,7 +113,7 @@ def compute_retrieval_quality(results: list[dict[str, Any]]) -> dict[str, float]
     recalls: list[float] = []
 
     for r in results:
-        retrieved = set(r.get("retrieved_turn_ids", []))
+        retrieved = set(r.get("turns_loaded", r.get("retrieved_turn_ids", [])))
         evidence = set(r.get("evidence_turn_ids", []))
         if not evidence:
             continue

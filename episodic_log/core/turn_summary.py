@@ -1,8 +1,9 @@
-"""Core TurnSummary data contract for the BM25 search index.
+"""Core TurnSummary data contract.
 
-TurnSummary records are stored separately from the execution log and are used
-exclusively as a search index.  The agent never reads summaries directly — it
-retrieves verbatim TurnEvent records from log.jsonl.
+TurnSummary records are stored separately from the execution log in
+``<summaries_dir>/<method>.jsonl``.  Memory conditions read them at
+evaluation time — either as a full context dump (recall), a keyword-searchable
+index (grep_recall), or a keyword-scored pre-load set (topk).
 """
 
 from __future__ import annotations
@@ -14,13 +15,13 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TurnSummary:
-    """One-line summary of a TurnEvent used as a BM25 search index entry.
+    """One-line summary of a TurnEvent used by memory conditions.
 
     Attributes:
         turn_id: Zero-padded string matching the corresponding TurnEvent.turn_id.
         session_id: Identifier for the enclosing session.
         summary: Human-readable (or model-generated) description of the turn.
-        method: Which summarizer produced this record ("structured", "haiku", "self").
+        method: Which summarizer produced this record ("lexical", "scout", "echo").
     """
 
     turn_id: str
