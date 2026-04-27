@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Full CHD evaluation pipeline — ingest → summarize → evaluate → judge → score
-# Optimised for 8x H100 SXM5 with vLLM. Total wall time: ~45 min.
-# Requires clean venv: bash rebuild_venv.sh
+# Optimised for 8x H100 SXM5. Total wall time: ~35 min from scratch.
+# Each step is skipped automatically if its output already exists.
 #
 # Usage:
-#   bash run_pipeline.sh
-#   MODEL=hf:Qwen/Qwen2.5-7B-Instruct bash run_pipeline.sh
+#   bash run_pipeline.sh              # skip any already-completed steps
+#   FORCE_INGEST=1 bash run_pipeline.sh   # force re-ingest even if data exists
+#   FORCE_SUMMARIZE=1 bash run_pipeline.sh  # force re-summarize
+#   FORCE_EVAL=1 bash run_pipeline.sh       # force re-evaluate (overwrites results)
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-MODEL="${MODEL:-vllm:Qwen/Qwen2.5-7B-Instruct:tp4}"
-JUDGE_MODEL="${JUDGE_MODEL:-vllm:Qwen/Qwen2.5-14B-Instruct:tp4}"
+JUDGE_MODEL="${JUDGE_MODEL:-vllm:Qwen/Qwen2.5-14B-Instruct:tp8}"
+HF_MODEL="${HF_MODEL:-hf:Qwen/Qwen3-32B}"
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
 
@@ -27,114 +29,149 @@ log "=== STEP 0: git pull ==="
 git pull
 
 # ---------------------------------------------------------------------------
-# STEP 1: Ingest all 500 LongMemEval sessions (CPU, ~5 min)
+# STEP 1: Ingest — skip if sessions_index.jsonl already exists
 # ---------------------------------------------------------------------------
-log "=== STEP 1: Ingest ==="
-rm -rf data/sessions data/sessions_index.jsonl
-python scripts/ingest.py 2>&1 | tee "$LOG_DIR/ingest.log"
+if [[ -f data/sessions_index.jsonl && -z "${FORCE_INGEST:-}" ]]; then
+    SESSION_COUNT=$(wc -l < data/sessions_index.jsonl | tr -d ' ')
+    log "=== STEP 1: Ingest — SKIPPED ($SESSION_COUNT sessions already in data/sessions_index.jsonl) ==="
+else
+    log "=== STEP 1: Ingest ==="
+    python scripts/ingest.py 2>&1 | tee "$LOG_DIR/ingest.log"
+fi
 
 # ---------------------------------------------------------------------------
-# STEP 2a: Lexical summarizer — CPU, no model needed (~2 min)
+# STEP 2a: Lexical summaries — skip if all sessions already have lexical.jsonl
 # ---------------------------------------------------------------------------
-log "=== STEP 2a: Summarize (lexical, CPU) ==="
-python scripts/summarize.py --method lexical 2>&1 | tee "$LOG_DIR/summarize_lexical.log"
+LEXICAL_DONE=$(find data/sessions -name "lexical.jsonl" -size +0c 2>/dev/null | wc -l | tr -d ' ')
+TOTAL_SESSIONS=$(wc -l < data/sessions_index.jsonl | tr -d ' ')
+
+if [[ "$LEXICAL_DONE" -ge "$TOTAL_SESSIONS" && -z "${FORCE_SUMMARIZE:-}" ]]; then
+    log "=== STEP 2a: Summarize (lexical) — SKIPPED ($LEXICAL_DONE/$TOTAL_SESSIONS sessions done) ==="
+else
+    log "=== STEP 2a: Summarize (lexical, CPU) ==="
+    python scripts/summarize.py --method lexical 2>&1 | tee "$LOG_DIR/summarize_lexical.log"
+fi
 
 # ---------------------------------------------------------------------------
-# STEP 2b: Scout (GPUs 0-3, tp=4) + Echo (GPUs 4-7, tp=4) in parallel
-#          vLLM mega-batch: 500 sessions → 1 LLM.generate() call → ~5 min each
+# STEP 2b: Scout + Echo — skip if all sessions already have both files
 # ---------------------------------------------------------------------------
-log "=== STEP 2b: Summarize scout (GPUs 0-3 vllm:tp4) + echo (GPUs 4-7 vllm:tp4) ==="
+SCOUT_DONE=$(find data/sessions -name "scout.jsonl" -size +0c 2>/dev/null | wc -l | tr -d ' ')
+ECHO_DONE=$(find data/sessions  -name "echo.jsonl"  -size +0c 2>/dev/null | wc -l | tr -d ' ')
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/summarize.py \
-    --method scout \
-    --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
-    2>&1 | tee "$LOG_DIR/summarize_scout.log" &
-SCOUT_PID=$!
+if [[ "$SCOUT_DONE" -ge "$TOTAL_SESSIONS" && "$ECHO_DONE" -ge "$TOTAL_SESSIONS" && -z "${FORCE_SUMMARIZE:-}" ]]; then
+    log "=== STEP 2b: Summarize (scout/echo) — SKIPPED (scout=$SCOUT_DONE echo=$ECHO_DONE / $TOTAL_SESSIONS) ==="
+else
+    log "=== STEP 2b: Summarize scout (GPUs 0-3 vllm:tp4) + echo (GPUs 4-7 vllm:tp4) ==="
 
-CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/summarize.py \
-    --method echo \
-    --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
-    2>&1 | tee "$LOG_DIR/summarize_echo.log" &
-ECHO_PID=$!
+    if [[ "$SCOUT_DONE" -lt "$TOTAL_SESSIONS" || -n "${FORCE_SUMMARIZE:-}" ]]; then
+        CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/summarize.py \
+            --method scout \
+            --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
+            2>&1 | tee "$LOG_DIR/summarize_scout.log" &
+        SCOUT_PID=$!
+    else
+        log "  scout — already done, skipping"
+        SCOUT_PID=""
+    fi
 
-wait $SCOUT_PID || { log "ERROR: scout summarizer failed"; exit 1; }
-wait $ECHO_PID  || { log "ERROR: echo summarizer failed"; exit 1; }
+    if [[ "$ECHO_DONE" -lt "$TOTAL_SESSIONS" || -n "${FORCE_SUMMARIZE:-}" ]]; then
+        CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/summarize.py \
+            --method echo \
+            --provider "vllm:Qwen/Qwen2.5-7B-Instruct:tp4" \
+            2>&1 | tee "$LOG_DIR/summarize_echo.log" &
+        ECHO_PID=$!
+    else
+        log "  echo — already done, skipping"
+        ECHO_PID=""
+    fi
+
+    [[ -n "$SCOUT_PID" ]] && { wait $SCOUT_PID || { log "ERROR: scout summarizer failed"; exit 1; }; }
+    [[ -n "$ECHO_PID"  ]] && { wait $ECHO_PID  || { log "ERROR: echo summarizer failed";  exit 1; }; }
+fi
 log "Summarization complete."
 
 # ---------------------------------------------------------------------------
-# STEP 3: Evaluate — HF provider (tool-calling needs HF, not vLLM)
-#         4 conditions × 2 GPUs each, all parallel (~30 min)
+# STEP 3: Evaluate — 8 conditions × 1 GPU each, all in parallel (~30 min)
+#         Qwen3-32B BF16 = ~64 GB, fits on 1× H100
 # ---------------------------------------------------------------------------
-log "=== STEP 3: Evaluate (4 conditions × 2 GPUs, hf provider) ==="
+log "=== STEP 3: Evaluate (8 conditions × 1 GPU, $HF_MODEL) ==="
 
-# Qwen3-32B BF16 = ~64 GB — fits on 1× H100, so 8 conditions run in parallel.
-HF_MODEL="hf:Qwen/Qwen3-32B"
+OVERWRITE_FLAG=""
+[[ -n "${FORCE_EVAL:-}" ]] && OVERWRITE_FLAG="--overwrite"
 
 CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
     --condition amnesiac \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
 EVAL0_PID=$!
 
 CUDA_VISIBLE_DEVICES=1 python scripts/evaluate.py \
     --condition recall --summary-method lexical \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
 EVAL1_PID=$!
 
 CUDA_VISIBLE_DEVICES=2 python scripts/evaluate.py \
     --condition recall --summary-method scout \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
 EVAL2_PID=$!
 
 CUDA_VISIBLE_DEVICES=3 python scripts/evaluate.py \
     --condition recall --summary-method echo \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
 EVAL3_PID=$!
 
 CUDA_VISIBLE_DEVICES=4 python scripts/evaluate.py \
     --condition grep_recall --summary-method lexical \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_grep_recall_lexical.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_grep_recall_lexical.log" &
 EVAL4_PID=$!
 
 CUDA_VISIBLE_DEVICES=5 python scripts/evaluate.py \
     --condition grep_recall --summary-method scout \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_grep_recall_scout.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_grep_recall_scout.log" &
 EVAL5_PID=$!
 
 CUDA_VISIBLE_DEVICES=6 python scripts/evaluate.py \
     --condition grep_recall --summary-method echo \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_grep_recall_echo.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_grep_recall_echo.log" &
 EVAL6_PID=$!
 
 CUDA_VISIBLE_DEVICES=7 python scripts/evaluate.py \
     --condition topk --summary-method lexical --retrieval-k 5 \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 2>&1 | tee "$LOG_DIR/eval_topk_lexical_k5.log" &
+    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_topk_lexical_k5.log" &
 EVAL7_PID=$!
 
-wait $EVAL0_PID || { log "ERROR: amnesiac eval failed"; exit 1; }
-wait $EVAL1_PID || { log "ERROR: recall/lexical eval failed"; exit 1; }
-wait $EVAL2_PID || { log "ERROR: recall/scout eval failed"; exit 1; }
-wait $EVAL3_PID || { log "ERROR: recall/echo eval failed"; exit 1; }
-wait $EVAL4_PID || { log "ERROR: grep_recall/lexical eval failed"; exit 1; }
-wait $EVAL5_PID || { log "ERROR: grep_recall/scout eval failed"; exit 1; }
-wait $EVAL6_PID || { log "ERROR: grep_recall/echo eval failed"; exit 1; }
-wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 eval failed"; exit 1; }
+wait $EVAL0_PID || { log "ERROR: amnesiac eval failed";        exit 1; }
+wait $EVAL1_PID || { log "ERROR: recall/lexical eval failed";  exit 1; }
+wait $EVAL2_PID || { log "ERROR: recall/scout eval failed";    exit 1; }
+wait $EVAL3_PID || { log "ERROR: recall/echo eval failed";     exit 1; }
+wait $EVAL4_PID || { log "ERROR: grep_recall/lexical failed";  exit 1; }
+wait $EVAL5_PID || { log "ERROR: grep_recall/scout failed";    exit 1; }
+wait $EVAL6_PID || { log "ERROR: grep_recall/echo failed";     exit 1; }
+wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 failed";      exit 1; }
 log "Evaluation complete."
 
 # ---------------------------------------------------------------------------
-# STEP 4: Judge — vLLM tp=8 across all 8 H100s (~5 min)
+# STEP 4: Judge — vLLM mega-batch, all 8 H100s via tp=8 (~5 min)
 # ---------------------------------------------------------------------------
 log "=== STEP 4: Judge ==="
 python scripts/judge.py \
-    --judge-provider "vllm:Qwen/Qwen2.5-14B-Instruct:tp8" \
-    --num-gpus 1 2>&1 | tee "$LOG_DIR/judge.log"
+    --judge-provider "$JUDGE_MODEL" \
+    2>&1 | tee "$LOG_DIR/judge.log"
 log "Judging complete."
 
 # ---------------------------------------------------------------------------
