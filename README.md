@@ -71,7 +71,7 @@ turn_id	summary
 0499	User said goodbye
 ```
 
-Every turn is listed. Multi-line summaries are collapsed to a single line so the index is compact. 500 turns at ~150 chars/row ≈ 75k chars typical — well within Qwen3-32B's 128k-token context window. A hard cap of 100k chars is applied only in pathological cases; if hit, the index is truncated at a line boundary with a notice.
+Every turn is always listed — no turn is ever dropped. Multi-line summaries are collapsed to a single line, then each summary is capped at 150 chars (appending `…` if clipped) so the full 500-turn index stays around 78k chars. A global 100k-char safety cap is also applied at the agent level; because the per-line cap keeps the typical index well below that, it never triggers in normal operation.
 
 ---
 

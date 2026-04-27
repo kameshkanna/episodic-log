@@ -37,6 +37,13 @@ TOOL_SCHEMAS: list[dict] = [LOAD_TURN_SCHEMA]
 GREP_TOOL_SCHEMAS: list[dict] = [GREP_MEMORY_SCHEMA, LOAD_TURN_SCHEMA]
 
 
+# Per-summary char cap so all 500 turns always fit in the index.
+# 500 turns × (5 id + 1 tab + 150 summary + 1 newline) ≈ 78 k chars — well under
+# the 100 k global cap.  Long echo summaries are clipped with "…" rather than
+# dropping the whole turn, so the model still sees every turn ID.
+_MAX_SUMMARY_LINE_CHARS: int = 150
+
+
 def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
     """Load all turn summaries and return them as a TSV memory index.
 
@@ -47,10 +54,10 @@ def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
         0001\\tUser asked about scheduling a dentist appointment for Tuesday
         ...
 
-    Multi-line summaries are collapsed to a single line (internal newlines
-    replaced with a space) so that every row is exactly one line.  This
-    guarantees all turns are represented even in sessions with verbose
-    echo summaries.
+    Multi-line summaries are collapsed to a single line.  Each summary is then
+    capped at ``_MAX_SUMMARY_LINE_CHARS`` characters (appending ``…`` if clipped)
+    so the full index of 500 turns always fits in the model's context without the
+    global truncation in ``AgentLoop`` ever needing to drop entire turns.
 
     Args:
         summaries_dir: Directory containing ``<method>.jsonl`` summary files.
@@ -73,8 +80,11 @@ def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
                 continue
             try:
                 s = TurnSummary.from_json(stripped)
-                # Collapse any internal newlines so every entry stays one line.
+                # Collapse internal newlines → single line.
                 one_line = " ".join(s.summary.split())
+                # Cap per-line length so no single verbose summary blows the budget.
+                if len(one_line) > _MAX_SUMMARY_LINE_CHARS:
+                    one_line = one_line[:_MAX_SUMMARY_LINE_CHARS - 1] + "…"
                 rows.append(f"{s.turn_id}\t{one_line}")
             except (KeyError, ValueError) as exc:
                 logger.warning(
