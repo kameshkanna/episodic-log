@@ -104,10 +104,15 @@ def grep_memory(
             "Use specific nouns or action words."
         )
 
-    lines = summaries_text.splitlines()
+    # summaries_text is TSV: first line is the header "turn_id\tsummary".
+    # Skip the header and search only the summary column (after the tab) so
+    # keywords like "turn" or "summary" don't spuriously match the header row,
+    # and numeric queries don't accidentally match turn IDs.
+    all_lines = summaries_text.splitlines()
+    data_lines = [ln for ln in all_lines if "\t" in ln and not ln.startswith("turn_id\t")]
     matches = [
-        line for line in lines
-        if any(kw in line.lower() for kw in kws)
+        ln for ln in data_lines
+        if any(kw in ln.split("\t", 1)[1].lower() for kw in kws)
     ]
 
     if not matches:
@@ -124,7 +129,7 @@ def grep_memory(
     )
 
     logger.debug(
-        "grep_memory: keywords=%r matched %d/%d lines.", keywords, len(matches), len(lines)
+        "grep_memory: keywords=%r matched %d/%d data lines.", keywords, len(matches), len(data_lines)
     )
     return (
         f"grep_memory: {len(results)} matching turn(s) for '{keywords}':\n\n"

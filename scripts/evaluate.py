@@ -242,7 +242,14 @@ def evaluate(
                         total += 1
                 shard.unlink()
 
-    typer.echo(f"Done. {total} results → {output_path}")
+    if total == 0:
+        logger.error(
+            "Merge produced 0 results for %s — all workers may have crashed; check logs/",
+            output_path,
+        )
+        typer.echo(f"WARNING: 0 results written to {output_path} — check worker logs!", err=True)
+    else:
+        typer.echo(f"Done. {total} results → {output_path}")
 
 
 # ---------------------------------------------------------------------------

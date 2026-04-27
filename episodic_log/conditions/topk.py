@@ -41,10 +41,14 @@ _TOKENISE_RE = re.compile(r"\w+")
 
 
 def _keyword_overlap(query: str, text: str) -> int:
-    """Count shared word tokens between query and text (case-insensitive)."""
+    """Count unique shared word tokens between query and text (case-insensitive).
+
+    Uses set intersection so repeated words in text don't inflate the score —
+    each token counts once regardless of how many times it appears.
+    """
     q_tokens = set(_TOKENISE_RE.findall(query.lower()))
-    t_tokens = _TOKENISE_RE.findall(text.lower())
-    return sum(1 for t in t_tokens if t in q_tokens)
+    t_tokens = set(_TOKENISE_RE.findall(text.lower()))
+    return len(q_tokens & t_tokens)
 
 
 class TopKCondition(BaseCondition):
@@ -105,13 +109,16 @@ class TopKCondition(BaseCondition):
         summaries: list[TurnSummary] = []
         if summary_path.exists():
             with summary_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
+                for lineno, line in enumerate(fh, start=1):
                     stripped = line.strip()
                     if stripped:
                         try:
                             summaries.append(TurnSummary.from_json(stripped))
-                        except (KeyError, ValueError):
-                            pass
+                        except (KeyError, ValueError) as exc:
+                            logger.warning(
+                                "TopKCondition: skipping malformed summary line %d in %s: %s",
+                                lineno, summary_path, exc,
+                            )
 
         # ── Build turn map ───────────────────────────────────────────────────
         turn_map: dict[str, TurnEvent] = {}
