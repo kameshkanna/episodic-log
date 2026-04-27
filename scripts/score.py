@@ -99,7 +99,7 @@ def score(
         if "__" in stem:
             condition_name, summary_method = stem.split("__", 1)
         else:
-            condition_name, summary_method = stem, "unknown"
+            condition_name, summary_method = stem, "-"
         # If file is inside a subdirectory, treat that directory name as model slug.
         model_slug = path.parent.name if path.parent != results_dir else "unknown"
 

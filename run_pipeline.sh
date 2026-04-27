@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Full CHD evaluation pipeline — ingest → summarize → evaluate → judge → score
-# Optimised for 8x H100 SXM5. Total wall time: ~35 min from scratch.
+# Optimised for 8x H100 SXM5. Total wall time: ~40 min from scratch.
+# 10 conditions in 3 waves: Wave 1 (amnesiac + recall×3), Wave 2 (grep_recall×3 + topk/lexical/k5),
+# Wave 3 (topk/scout/k5 + topk/echo/k5).
 # Each step is skipped automatically if its output already exists.
 #
 # Usage:
@@ -172,6 +174,27 @@ wait $EVAL5_PID || { log "ERROR: grep_recall/scout failed";   exit 1; }
 wait $EVAL6_PID || { log "ERROR: grep_recall/echo failed";    exit 1; }
 wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 failed";     exit 1; }
 log "Wave 2 complete."
+
+# Wave 3: topk/scout/k5 + topk/echo/k5 (complete the summary_method × topk matrix)
+log "--- Wave 3: topk/scout/k5 + topk/echo/k5 ---"
+
+CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
+    --condition topk --summary-method scout --retrieval-k 5 \
+    --provider "$HF_MODEL" \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_topk_scout_k5.log" &
+EVAL8_PID=$!
+
+CUDA_VISIBLE_DEVICES=2,3 python scripts/evaluate.py \
+    --condition topk --summary-method echo --retrieval-k 5 \
+    --provider "$HF_MODEL" \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
+    2>&1 | tee "$LOG_DIR/eval_topk_echo_k5.log" &
+EVAL9_PID=$!
+
+wait $EVAL8_PID || { log "ERROR: topk/scout/k5 failed"; exit 1; }
+wait $EVAL9_PID || { log "ERROR: topk/echo/k5 failed";  exit 1; }
+log "Wave 3 complete."
 log "Evaluation complete."
 
 # ---------------------------------------------------------------------------

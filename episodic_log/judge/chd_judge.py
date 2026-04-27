@@ -240,6 +240,10 @@ def _parse_verdict(raw: str) -> JudgeVerdict:
     if match:
         verdict_str = match.group(1).lower()
         if verdict_str not in _CHD_CATEGORIES:
+            logger.warning(
+                "CHDJudge: unrecognised verdict %r — falling back to 'confabulation'. raw=%r",
+                verdict_str, raw[:200],
+            )
             verdict_str = "confabulation"
         confidence = float(match.group(2))
         reason = match.group(3)
@@ -253,8 +257,15 @@ def _parse_verdict(raw: str) -> JudgeVerdict:
     # Try JSON parse fallback.
     try:
         obj = json.loads(raw.strip())
+        verdict_str = obj.get("verdict", "confabulation").lower()
+        if verdict_str not in _CHD_CATEGORIES:
+            logger.warning(
+                "CHDJudge: JSON fallback — unrecognised verdict %r → 'confabulation'. raw=%r",
+                verdict_str, raw[:200],
+            )
+            verdict_str = "confabulation"
         return JudgeVerdict(
-            verdict=obj.get("verdict", "confabulation").lower(),
+            verdict=verdict_str,
             confidence=float(obj.get("confidence", 0.0)),
             reason=obj.get("reason", "parse error"),
             raw_response=raw,

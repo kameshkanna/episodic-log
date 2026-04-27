@@ -164,11 +164,13 @@ Step 2a summarize.py        CPU        ~2 min   lexical summaries (no model)
 Step 2b summarize.py        vLLM tp4   ~5 min   scout (GPUs 0-3) + echo (GPUs 4-7) in parallel
                                                  Each skipped independently if already complete
 
-Step 3  evaluate.py         HF BF16    ~40 min  8 conditions in 2 waves of 4
+Step 3  evaluate.py         HF BF16    ~45 min  10 conditions in 3 waves
          Wave 1             Qwen3-32B           amnesiac + recall × 3
                             2× H100/worker      GPUs 0-1 / 2-3 / 4-5 / 6-7 (parallel)
          Wave 2                                 grep_recall × 3 + topk/lexical/k5
                                                 GPUs 0-1 / 2-3 / 4-5 / 6-7 (parallel)
+         Wave 3                                 topk/scout/k5 + topk/echo/k5
+                                                GPUs 0-1 / 2-3 (parallel)
 
 Step 4  judge.py            vLLM tp8   ~5 min   all verdicts in one generate() call
 Step 5  score.py            CPU        <1 min   print results table
