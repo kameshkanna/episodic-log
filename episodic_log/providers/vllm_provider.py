@@ -10,6 +10,7 @@ Provider spec: ``vllm:<model_id>`` or ``vllm:<model_id>:tp4``
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from episodic_log.providers.base import BaseProvider, normalize_messages
@@ -67,6 +68,12 @@ class VLLMProvider(BaseProvider):
             model_name, tensor_parallel_size, gpu_memory_utilization,
         )
 
+        # vLLM reads HF_TOKEN from the environment automatically for model downloads.
+        # Mirror it to HUGGING_FACE_HUB_TOKEN (the older env var) so both are set.
+        hf_token: str | None = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
         self._llm = LLM(
             model=model_name,
             tensor_parallel_size=tensor_parallel_size,
@@ -78,7 +85,7 @@ class VLLMProvider(BaseProvider):
         self._SamplingParams = SamplingParams
 
         self._tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
+            model_name, trust_remote_code=True, token=hf_token or True
         )
         logger.info("VLLMProvider: model loaded.")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -59,16 +60,18 @@ class HuggingFaceProvider(BaseProvider):
         )
 
         bnb_config = _build_bnb_config(quantization)
+        hf_token: str | None = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         kwargs: dict[str, Any] = {
             "device_map": device_map,
             "torch_dtype": "auto",
             "trust_remote_code": True,
+            "token": hf_token or True,
         }
         if bnb_config is not None:
             kwargs["quantization_config"] = bnb_config
 
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
+            model_name, trust_remote_code=True, token=hf_token or True
         )
         self._model = transformers.AutoModelForCausalLM.from_pretrained(
             model_name, **kwargs

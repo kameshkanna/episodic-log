@@ -141,8 +141,8 @@ Step 1  ingest.py           CPU       ~5 min   500 sessions → log.jsonl files
 Step 2a summarize.py        CPU       ~2 min   lexical summaries (no model)
 Step 2b summarize.py        vLLM tp4  ~5 min   scout + echo in parallel
                             GPUs 0-3 / 4-7
-Step 3  evaluate.py         HF BF16   ~30 min  4 conditions × 2 GPUs each
-                            Qwen3-72B, device_map=auto across 2 H100s
+Step 3  evaluate.py         HF BF16   ~30 min  8 conditions × 1 GPU each
+                            Qwen3-32B, 1× H100 per worker (fits in 64 GB)
 Step 4  judge.py            vLLM tp8  ~5 min   all verdicts in one generate() call
 Step 5  score.py            CPU       <1 min   print results table
 ```
@@ -158,23 +158,23 @@ Run grep_recall and topk separately as ablations (see below).
 # 4 conditions in parallel — each gets 2 H100s for Qwen3-72B BF16
 CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
     --condition amnesiac \
-    --provider hf:Qwen/Qwen3-72B \
-    --num-gpus 2 --gpus-per-worker 2 &
+    --provider hf:Qwen/Qwen3-32B \
+    --num-gpus 1 --gpus-per-worker 1 &
 
 CUDA_VISIBLE_DEVICES=2,3 python scripts/evaluate.py \
     --condition recall --summary-method lexical \
-    --provider hf:Qwen/Qwen3-72B \
-    --num-gpus 2 --gpus-per-worker 2 &
+    --provider hf:Qwen/Qwen3-32B \
+    --num-gpus 1 --gpus-per-worker 1 &
 
 CUDA_VISIBLE_DEVICES=4,5 python scripts/evaluate.py \
     --condition recall --summary-method scout \
-    --provider hf:Qwen/Qwen3-72B \
-    --num-gpus 2 --gpus-per-worker 2 &
+    --provider hf:Qwen/Qwen3-32B \
+    --num-gpus 1 --gpus-per-worker 1 &
 
 CUDA_VISIBLE_DEVICES=6,7 python scripts/evaluate.py \
     --condition recall --summary-method echo \
-    --provider hf:Qwen/Qwen3-72B \
-    --num-gpus 2 --gpus-per-worker 2 &
+    --provider hf:Qwen/Qwen3-32B \
+    --num-gpus 1 --gpus-per-worker 1 &
 
 wait
 
@@ -189,8 +189,8 @@ python scripts/score.py
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
     --condition grep_recall --summary-method lexical \
-    --provider hf:Qwen/Qwen3-72B \
-    --num-gpus 2 --gpus-per-worker 2
+    --provider hf:Qwen/Qwen3-32B \
+    --num-gpus 1 --gpus-per-worker 1
 ```
 
 ---
@@ -201,7 +201,7 @@ CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
 for k in 3 5 10; do
   CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
       --condition topk --summary-method lexical --retrieval-k $k \
-      --provider hf:Qwen/Qwen3-72B \
+      --provider hf:Qwen/Qwen3-32B \
       --num-gpus 2 --gpus-per-worker 2
 done
 ```
@@ -299,8 +299,8 @@ Result row schema:
 |---|---|
 | Groq-only (no GPU) | Any CPU |
 | Summarize + judge (vLLM) | 1× H100 80 GB |
-| Evaluate with Qwen3-72B BF16 | 2× H100 80 GB per condition |
-| Full parallel pipeline (4 conditions) | 8× H100 80 GB |
+| Evaluate with Qwen3-32B BF16 | 1× H100 80 GB per condition |
+| Full parallel pipeline (8 conditions) | 8× H100 80 GB |
 
 ---
 
