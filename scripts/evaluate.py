@@ -306,6 +306,63 @@ def _run_worker(
     failed = 0
     written = 0
 
+    # ── Batch path: vLLM provider with generate_with_tools_batch ────────────
+    # For recall/grep_recall conditions, run all sessions simultaneously via
+    # step-synchronised batch inference instead of one-by-one.  This keeps the
+    # GPU saturated — while one session's tool calls execute on CPU, all other
+    # sessions' prompts are in the same vLLM batch.
+    _use_batch = (
+        hasattr(provider, "generate_with_tools_batch")
+        and condition.startswith(("recall/", "grep_recall/"))
+    )
+
+    if _use_batch:
+        from episodic_log.agent.batch_loop import run_batch
+        _mode = "grep_and_load" if condition.startswith("grep_recall/") else "load_only"
+        worker_logger.info(
+            "%s: batch mode — %d sessions, condition=%s mode=%s",
+            tag, len(sessions), condition, _mode,
+        )
+        try:
+            traces = run_batch(
+                sessions=sessions,
+                summary_method=summary_method,
+                mode=_mode,
+                provider=provider,
+            )
+        except Exception as exc:
+            worker_logger.error(
+                "%s: batch_loop failed: %s", tag, exc, exc_info=True
+            )
+            traces = []
+
+        with shard_path.open("w", encoding="utf-8") as fh:
+            for meta, trace in zip(sessions, traces):
+                record = {
+                    "session_id": trace.session_id,
+                    "question_id": meta.get("question_id", ""),
+                    "condition": condition,
+                    "summary_method": summary_method,
+                    "question": trace.question,
+                    "ground_truth": meta.get("answer", ""),
+                    "predicted_answer": trace.answer,
+                    "tool_calls": [tc.to_dict() for tc in trace.tool_calls],
+                    "turns_loaded": trace.turns_loaded,
+                    "evidence_turn_ids": meta.get("evidence_turn_ids", []),
+                    "question_type": meta.get("question_type", ""),
+                    "verdict": None,
+                    "confidence": None,
+                    "judge_reason": None,
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                written += 1
+
+        worker_logger.info(
+            "%s: batch done — written=%d  total=%d", tag, written, len(sessions),
+        )
+        return
+
+    # ── Sequential path: HuggingFace or single-session vLLM ─────────────────
     with shard_path.open("w", encoding="utf-8") as fh:
         for meta in bar:
             try:

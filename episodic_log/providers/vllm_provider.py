@@ -205,6 +205,36 @@ class VLLMProvider(BaseProvider):
         outputs = self._llm.generate(prompts, params)
         return [o.outputs[0].text.strip() for o in outputs]
 
+    def _parse_tool_or_text(self, raw_text: str) -> dict[str, Any]:
+        """Parse one model output into a tool_call or text response dict."""
+        parse_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+        match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", parse_text, re.DOTALL)
+        if match:
+            try:
+                payload: dict[str, Any] = json.loads(match.group(1))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"VLLMProvider: failed to parse tool_call JSON: {exc}\n"
+                    f"Raw: {match.group(1)!r}"
+                ) from exc
+            tool_args = payload.get("arguments", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            return {
+                "type": "tool_call",
+                "content": "",
+                "tool_name": payload.get("name", ""),
+                "tool_args": tool_args,
+                "raw_message": {"role": "assistant", "content": raw_text},
+            }
+        return {
+            "type": "text",
+            "content": parse_text,
+            "tool_name": "",
+            "tool_args": {},
+            "raw_message": {"role": "assistant", "content": raw_text},
+        }
+
     def generate_with_tools(
         self,
         messages: list[dict[str, Any]],
@@ -213,74 +243,46 @@ class VLLMProvider(BaseProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> dict[str, Any]:
-        """Run one tool-calling agent step via vLLM's fast single-prompt path.
+        """Run one tool-calling agent step (single session).
 
-        Uses ``apply_chat_template(tools=...)`` for prompt construction and
-        parses Qwen-native ``<tool_call>...</tool_call>`` blocks from the
-        output — identical contract to :class:`HuggingFaceProvider` so the
-        agent loop works transparently with either backend.
+        Delegates to :meth:`generate_with_tools_batch` for a batch of one.
+        """
+        return self.generate_with_tools_batch(
+            [messages], tools, system=system,
+            max_tokens=max_tokens, temperature=temperature,
+        )[0]
+
+    def generate_with_tools_batch(
+        self,
+        batch_messages: list[list[dict[str, Any]]],
+        tools: list[dict],
+        system: str | None = None,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Run one agent step for many sessions simultaneously in a single vLLM call.
+
+        All sessions are at the same step in their agent loop.  Prompts are
+        built in parallel (CPU), submitted to vLLM in one batch, and each
+        output is independently parsed into a tool_call or text response.
+
+        This is the core primitive for the batch agent loop — submitting
+        N sessions at once keeps the GPU busy instead of waiting for one
+        session's tool execution before starting the next forward pass.
 
         Args:
-            messages: Full conversation history as chat-message dicts.
-            tools: List of OpenAI-format tool schema dicts.
-            system: Optional system prompt.
-            max_tokens: Maximum new tokens to generate.
+            batch_messages: One message list per active session.
+            tools: OpenAI-format tool schema dicts (same for all sessions).
+            system: Optional system prompt applied uniformly.
+            max_tokens: Maximum new tokens per output.
             temperature: Sampling temperature; 0.0 = greedy.
 
         Returns:
-            Dict with keys ``"type"``, ``"content"``, ``"tool_name"``,
-            ``"tool_args"``, and ``"raw_message"`` — same schema as
-            :meth:`HuggingFaceProvider.generate_with_tools`.
-
-        Raises:
-            RuntimeError: If the tool_call JSON payload cannot be parsed.
+            Ordered list of response dicts (same schema as
+            :meth:`generate_with_tools`).
         """
-        prompt = self._build_prompt(messages, system, tools)
+        prompts = [self._build_prompt(msgs, system, tools) for msgs in batch_messages]
         params = self._sampling_params(max_tokens, temperature)
-
-        outputs = self._llm.generate([prompt], params)
-        raw_text: str = outputs[0].outputs[0].text.strip()
-
-        # Strip Qwen3 <think>...</think> blocks before parsing.
-        parse_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
-
-        tool_call_match = re.search(
-            r"<tool_call>\s*(.*?)\s*</tool_call>",
-            parse_text,
-            re.DOTALL,
-        )
-        if tool_call_match:
-            payload_str = tool_call_match.group(1)
-            try:
-                payload: dict[str, Any] = json.loads(payload_str)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    f"VLLMProvider.generate_with_tools: failed to parse tool_call JSON: {exc}\n"
-                    f"Raw payload: {payload_str!r}"
-                ) from exc
-
-            tool_name: str = payload.get("name", "")
-            tool_args: dict[str, Any] = payload.get("arguments", {})
-            if not isinstance(tool_args, dict):
-                tool_args = {}
-
-            logger.debug(
-                "VLLMProvider.generate_with_tools: tool_call name=%s args=%s",
-                tool_name, tool_args,
-            )
-            return {
-                "type": "tool_call",
-                "content": "",
-                "tool_name": tool_name,
-                "tool_args": tool_args,
-                "raw_message": {"role": "assistant", "content": raw_text},
-            }
-
-        logger.debug("VLLMProvider.generate_with_tools: text response len=%d", len(parse_text))
-        return {
-            "type": "text",
-            "content": parse_text,
-            "tool_name": "",
-            "tool_args": {},
-            "raw_message": {"role": "assistant", "content": raw_text},
-        }
+        logger.debug("VLLMProvider.generate_with_tools_batch: %d prompts", len(prompts))
+        outputs = self._llm.generate(prompts, params)
+        return [self._parse_tool_or_text(o.outputs[0].text.strip()) for o in outputs]
