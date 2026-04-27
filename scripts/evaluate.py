@@ -196,13 +196,17 @@ def evaluate(
     chunks = _split_sessions(all_sessions, num_workers)
 
     if num_workers == 1:
+        # The shell already set CUDA_VISIBLE_DEVICES to the correct physical GPUs.
+        # Do NOT pass cuda_devices — that would recompute local indices [0,1,...] and
+        # override the shell value, putting this worker back on physical GPUs 0,1.
         _run_worker(
-            cuda_devices=worker_devices[0] if is_hf else None,
+            cuda_devices=None,
             sessions=all_sessions,
             condition=cond_key,
             summary_method=summary_method,
             provider_spec=provider_spec,
             shard_path=shard_paths[0],
+            device_map="auto" if is_hf else "cpu",
         )
     else:
         ctx = mp.get_context("spawn")
@@ -214,7 +218,8 @@ def evaluate(
                 continue
             p = ctx.Process(
                 target=_run_worker,
-                args=(cuda_devs, chunk, cond_key, summary_method, provider_spec, shard),
+                args=(cuda_devs, chunk, cond_key, summary_method, provider_spec, shard,
+                      "auto" if is_hf else "cpu"),
                 name=f"eval-worker{i}",
             )
             p.start()
@@ -251,29 +256,38 @@ def _run_worker(
     summary_method: str,
     provider_spec: str,
     shard_path: Path,
+    device_map: str = "cpu",
 ) -> None:
-    """Load model once, run condition on every session in this chunk."""
+    """Load model once, run condition on every session in this chunk.
+
+    ``cuda_devices`` is only set when this function runs in a *spawned* child
+    process that needs to select its GPU subset explicitly.  When called from
+    the main process (num_workers == 1) it must be ``None`` — the shell has
+    already set ``CUDA_VISIBLE_DEVICES`` to the correct physical GPU IDs and
+    overriding it here would remap all workers back to GPUs 0,1.
+    """
     if cuda_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+        tag = f"GPU{cuda_devices}"
         logging.basicConfig(
             level=logging.INFO,
             format=f"%(asctime)s %(levelname)s [GPU{cuda_devices}] %(name)s: %(message)s",
         )
     else:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "auto")
+        tag = f"GPU{visible}"
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            format=f"%(asctime)s %(levelname)s [{tag}] %(name)s: %(message)s",
         )
 
     worker_logger = logging.getLogger(__name__)
 
     from episodic_log.providers import get_provider
-    device_map = "auto" if cuda_devices is not None else "cpu"
     provider = get_provider(provider_spec, device_map=device_map)
 
     cond = get_condition(condition)
 
-    tag = f"GPU{cuda_devices}" if cuda_devices is not None else "CPU"
     bar = tqdm(
         sessions,
         desc=f"{tag}/{condition}/{summary_method}",
