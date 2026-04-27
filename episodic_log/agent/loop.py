@@ -21,16 +21,19 @@ from episodic_log.tools.session_tools import format_summaries_as_context, make_s
 logger = logging.getLogger(__name__)
 
 # Hard cap on the summary block injected into the first user message.
-# Qwen3-32B with tp=1 has ~80 GB; at BF16 a 32k-token context leaves ~15 GB
-# for KV cache, which is sufficient.  The cap prevents extreme sessions
-# (500 turns × verbose echo summaries) from blowing through available VRAM.
-_MAX_SUMMARY_CHARS: int = 40_000  # ~10k tokens for the summary index
+# TSV format (turn_id\tone-line-summary) collapses multi-line content and keeps
+# each row compact.  500 turns × ~150 chars/row ≈ 75k chars typical; 500 × 512
+# chars/row (max 128 tokens) ≈ 256k worst case.  100k covers the typical case
+# and leaves the token budget for tool results and the model's own output.
+# Qwen3-32B context window is 128k tokens; 100k chars ≈ 25k tokens for the index.
+_MAX_SUMMARY_CHARS: int = 100_000
 
 _SYSTEM_PROMPT_LOAD_ONLY: str = (
     "You are answering a question about a past conversation.\n"
-    "The memory index in the user message lists every turn with a one-line summary.\n\n"
+    "The memory index in the user message is a TSV table: turn_id<TAB>one-line-summary.\n"
+    "Every turn in the session is listed — nothing is omitted.\n\n"
     "Instructions:\n"
-    "1. Read the memory index and identify which turns are relevant to the question.\n"
+    "1. Scan the memory index and identify which turn IDs are relevant to the question.\n"
     "2. Call load_turn for each relevant turn to read its full verbatim content.\n"
     "3. Answer ONLY after reading the supporting turns.\n"
     "4. If the answer spans multiple turns, load all of them.\n"
@@ -155,18 +158,23 @@ class AgentLoop:
         if self._mode == "load_only":
             summary_context = format_summaries_as_context(summaries_dir, summary_method)
             if summary_context:
-                # Truncate if the summary block is excessively large.
                 if len(summary_context) > self._max_summary_chars:
-                    summary_context = summary_context[: self._max_summary_chars]
+                    # Truncate at a line boundary so no row is split mid-way.
+                    cutoff = summary_context.rfind("\n", 0, self._max_summary_chars)
+                    if cutoff == -1:
+                        cutoff = self._max_summary_chars
+                    summary_context = summary_context[:cutoff]
                     summary_context += (
-                        "\n...[summary index truncated — earlier turns omitted to fit context]"
+                        "\n...[index truncated — some turns omitted; use load_turn by ID if needed]"
                     )
                     logger.warning(
                         "AgentLoop.run: summary context truncated to %d chars for session=%s",
-                        self._max_summary_chars, session_id,
+                        len(summary_context), session_id,
                     )
+                # Count data rows (skip the header line).
+                n_turns = max(0, summary_context.count("\n"))
                 first_message = (
-                    f"Memory index ({summary_context.count(chr(10)) + 1} turns):\n"
+                    f"Memory index — {n_turns} turns (columns: turn_id TAB summary):\n"
                     f"{summary_context}\n\n"
                     f"Question: {question}"
                 )

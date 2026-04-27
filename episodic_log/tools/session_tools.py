@@ -38,21 +38,34 @@ GREP_TOOL_SCHEMAS: list[dict] = [GREP_MEMORY_SCHEMA, LOAD_TURN_SCHEMA]
 
 
 def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
-    """Load all turn summaries and return them as a formatted ``[turn_id] text`` block.
+    """Load all turn summaries and return them as a TSV memory index.
+
+    Format: one row per turn, tab-separated::
+
+        turn_id\\tsummary
+        0000\\tUser greeted the assistant
+        0001\\tUser asked about scheduling a dentist appointment for Tuesday
+        ...
+
+    Multi-line summaries are collapsed to a single line (internal newlines
+    replaced with a space) so that every row is exactly one line.  This
+    guarantees all turns are represented even in sessions with verbose
+    echo summaries.
 
     Args:
         summaries_dir: Directory containing ``<method>.jsonl`` summary files.
         method: Summarizer method key (e.g. ``"lexical"``, ``"scout"``).
 
     Returns:
-        Multi-line string, one entry per turn.  Empty string if file missing.
+        TSV string with a header row followed by one row per turn.
+        Returns an empty string if the summary file is missing.
     """
     summary_path = summaries_dir / f"{method}.jsonl"
     if not summary_path.exists():
         logger.warning("format_summaries_as_context: summary file not found at %s", summary_path)
         return ""
 
-    lines: list[str] = []
+    rows: list[str] = []
     with summary_path.open("r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
             stripped = line.strip()
@@ -60,7 +73,9 @@ def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
                 continue
             try:
                 s = TurnSummary.from_json(stripped)
-                lines.append(f"[{s.turn_id}] {s.summary}")
+                # Collapse any internal newlines so every entry stays one line.
+                one_line = " ".join(s.summary.split())
+                rows.append(f"{s.turn_id}\t{one_line}")
             except (KeyError, ValueError) as exc:
                 logger.warning(
                     "format_summaries_as_context: skipping malformed line %d in %s: %s",
@@ -69,9 +84,13 @@ def format_summaries_as_context(summaries_dir: Path, method: str) -> str:
 
     logger.debug(
         "format_summaries_as_context: %d summaries loaded from %s/%s",
-        len(lines), summaries_dir.name, method,
+        len(rows), summaries_dir.name, method,
     )
-    return "\n".join(lines)
+    if not rows:
+        return ""
+
+    header = "turn_id\tsummary"
+    return header + "\n" + "\n".join(rows)
 
 
 def make_session_tools(
