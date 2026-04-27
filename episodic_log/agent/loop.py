@@ -8,6 +8,7 @@ verbatim content from ``log.jsonl`` before producing a final answer.
 
 from __future__ import annotations
 
+import gc
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,12 @@ from episodic_log.providers.base import BaseProvider
 from episodic_log.tools.session_tools import format_summaries_as_context, make_session_tools
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on the summary block injected into the first user message.
+# Qwen3-32B with tp=1 has ~80 GB; at BF16 a 32k-token context leaves ~15 GB
+# for KV cache, which is sufficient.  The cap prevents extreme sessions
+# (500 turns × verbose echo summaries) from blowing through available VRAM.
+_MAX_SUMMARY_CHARS: int = 40_000  # ~10k tokens for the summary index
 
 _SYSTEM_PROMPT_LOAD_ONLY: str = (
     "You are answering a question about a past conversation.\n"
@@ -42,9 +49,6 @@ _SYSTEM_PROMPT_GREP: str = (
     "6. Do NOT guess — if you cannot find the answer after searching, say so."
 )
 
-# Default — overridden per-call based on mode.
-SYSTEM_PROMPT = _SYSTEM_PROMPT_LOAD_ONLY
-
 
 class AgentLoop:
     """Runs the tool-use agent loop: model reads summary index, loads turns, answers.
@@ -52,6 +56,8 @@ class AgentLoop:
     The loop operates as follows:
 
     1. Format all turn summaries as a text block and inject into the first message.
+       If the block exceeds *max_summary_chars* characters it is truncated with a
+       notice so the model knows the index is partial.
     2. Inject the system prompt.
     3. The model reads the summary index, then calls ``load_turn`` for relevant turns.
     4. Repeat up to *max_tool_calls* times:
@@ -59,6 +65,8 @@ class AgentLoop:
        a. Call :meth:`~episodic_log.providers.base.BaseProvider.generate_with_tools`.
        b. If the response is a final text answer, break.
        c. If the response is a ``load_turn`` call, execute it, append result, continue.
+       d. On ``OutOfMemoryError``: flush CUDA cache, drop the oldest tool-result
+          exchange from the message history, and retry the step once.
 
     5. If the budget is exhausted without a text answer, force one via
        :meth:`~episodic_log.providers.base.BaseProvider.generate`.
@@ -68,10 +76,14 @@ class AgentLoop:
         provider: An instantiated :class:`~episodic_log.providers.base.BaseProvider`.
         max_tool_calls: Maximum ``load_turn`` calls before forcing a final answer.
             Defaults to 15.
+        mode: ``"load_only"`` (summary dump + load_turn) or ``"grep_and_load"``
+            (model formulates keywords → grep → load_turn).
+        max_summary_chars: Hard cap on the summary block size injected into the
+            first user message.  Summaries beyond this are truncated.
 
     Raises:
         TypeError: If *provider* is not a BaseProvider instance.
-        ValueError: If *max_tool_calls* is not a positive integer.
+        ValueError: If *max_tool_calls* is not a positive integer or *mode* is invalid.
     """
 
     def __init__(
@@ -79,6 +91,7 @@ class AgentLoop:
         provider: BaseProvider,
         max_tool_calls: int = 15,
         mode: str = "load_only",
+        max_summary_chars: int = _MAX_SUMMARY_CHARS,
     ) -> None:
         if not isinstance(provider, BaseProvider):
             raise TypeError(
@@ -93,6 +106,7 @@ class AgentLoop:
         self._provider = provider
         self._max_tool_calls = max_tool_calls
         self._mode = mode
+        self._max_summary_chars = max_summary_chars
 
     def run(
         self,
@@ -138,11 +152,19 @@ class AgentLoop:
             mode=self._mode,
         )
 
-        # Build the first user message depending on mode.
         if self._mode == "load_only":
-            # Dump all summaries upfront — model reads and calls load_turn.
             summary_context = format_summaries_as_context(summaries_dir, summary_method)
             if summary_context:
+                # Truncate if the summary block is excessively large.
+                if len(summary_context) > self._max_summary_chars:
+                    summary_context = summary_context[: self._max_summary_chars]
+                    summary_context += (
+                        "\n...[summary index truncated — earlier turns omitted to fit context]"
+                    )
+                    logger.warning(
+                        "AgentLoop.run: summary context truncated to %d chars for session=%s",
+                        self._max_summary_chars, session_id,
+                    )
                 first_message = (
                     f"Memory index ({summary_context.count(chr(10)) + 1} turns):\n"
                     f"{summary_context}\n\n"
@@ -151,7 +173,6 @@ class AgentLoop:
             else:
                 first_message = f"No memory index available.\n\nQuestion: {question}"
         else:
-            # grep_and_load — model receives only the question and must search.
             first_message = question
 
         logger.info(
@@ -171,12 +192,39 @@ class AgentLoop:
 
         for step in range(self._max_tool_calls):
             logger.debug("AgentLoop.run: step=%d/%d", step + 1, self._max_tool_calls)
-            result = self._provider.generate_with_tools(
-                messages=messages,
-                tools=tool_schemas,
-                system=system_prompt,
-                max_tokens=1024,
-            )
+
+            try:
+                result = self._provider.generate_with_tools(
+                    messages=messages,
+                    tools=tool_schemas,
+                    system=system_prompt,
+                    max_tokens=1024,
+                )
+            except Exception as oom_exc:
+                if not _is_oom(oom_exc):
+                    raise
+                # OOM survived the provider's own retry — trim the agent-level
+                # message history (drop oldest tool-result exchange) and retry.
+                logger.warning(
+                    "AgentLoop.run: step=%d OOM for session=%s — trimming message history",
+                    step + 1, session_id,
+                )
+                messages = _trim_oldest_tool_exchange(messages)
+                _flush_cuda()
+                try:
+                    result = self._provider.generate_with_tools(
+                        messages=messages,
+                        tools=tool_schemas,
+                        system=system_prompt,
+                        max_tokens=512,  # reduced budget after trim
+                    )
+                except Exception as retry_exc:
+                    # Give up on this step; force a final answer from what we have.
+                    logger.error(
+                        "AgentLoop.run: step=%d OOM retry also failed (%s) — forcing answer",
+                        step + 1, retry_exc,
+                    )
+                    break
 
             if result["type"] == "text":
                 final_answer = result["content"]
@@ -222,6 +270,21 @@ class AgentLoop:
                 system=system_prompt,
             )
 
+        if not final_answer:
+            # Forced answer path when loop exited via break (OOM gave up early).
+            forced_prompt = f"Based on what you have found so far, answer: {question}"
+            try:
+                final_answer = self._provider.generate(
+                    messages=messages + [{"role": "user", "content": forced_prompt}],
+                    system=system_prompt,
+                )
+            except Exception as exc:
+                logger.error(
+                    "AgentLoop.run: force-answer also failed for session=%s: %s",
+                    session_id, exc,
+                )
+                final_answer = "Unable to answer due to resource constraints."
+
         return AgentTrace(
             question=question,
             answer=final_answer,
@@ -251,3 +314,57 @@ class AgentLoop:
                 tool_name, type(exc).__name__, exc,
             )
             return f"Error calling {tool_name}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Module helpers
+# ---------------------------------------------------------------------------
+
+def _is_oom(exc: BaseException) -> bool:
+    """Return True if *exc* is a CUDA / MPS out-of-memory error."""
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    return (
+        "OutOfMemoryError" in name
+        or "out of memory" in msg
+        or "CUDA out of memory" in str(exc)
+    )
+
+
+def _trim_oldest_tool_exchange(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove the oldest (assistant tool_call + tool result) pair from *messages*.
+
+    Keeps the first message (the anchor / summary context) and the system
+    prompt intact.  Returns the original list unchanged if there is nothing
+    to trim.
+    """
+    if len(messages) <= 2:
+        return messages
+
+    # Find the first assistant message that has a tool_call (index > 0).
+    for i in range(1, len(messages)):
+        if messages[i].get("role") == "assistant":
+            # Remove this message and the following tool-result message (if present).
+            end = i + 2 if i + 1 < len(messages) and messages[i + 1].get("role") == "tool" else i + 1
+            removed = messages[i:end]
+            logger.debug(
+                "_trim_oldest_tool_exchange: removing %d messages starting at index %d",
+                len(removed), i,
+            )
+            return messages[:i] + messages[end:]
+
+    return messages
+
+
+def _flush_cuda() -> None:
+    """Clear CUDA cache and run GC."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()

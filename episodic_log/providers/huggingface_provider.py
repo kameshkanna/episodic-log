@@ -13,6 +13,23 @@ from episodic_log.providers.base import BaseProvider, normalize_messages
 
 logger = logging.getLogger(__name__)
 
+# Maximum input tokens before we truncate aggressively to avoid OOM.
+_MAX_INPUT_TOKENS: int = 28_000
+# Number of recent messages kept when the context is trimmed on OOM retry.
+_OOM_TRIM_KEEP_MESSAGES: int = 4
+
+
+def _flush_cuda() -> None:
+    """Clear CUDA cache and run GC."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
+
 
 class HuggingFaceProvider(BaseProvider):
     """LLM provider backed by a local HuggingFace causal language model.
@@ -21,11 +38,18 @@ class HuggingFaceProvider(BaseProvider):
     optional 4-bit or 8-bit quantization via ``BitsAndBytesConfig``.  Uses
     ``apply_chat_template`` for prompt construction.
 
+    OOM resilience: every generation path catches ``torch.cuda.OutOfMemoryError``,
+    flushes the CUDA cache, trims the context to the most recent messages, and
+    retries once before re-raising.
+
     Args:
         model_name: HuggingFace model ID or local path.
         quantization: One of ``"4bit"``, ``"8bit"``, or ``None`` (full precision).
         device_map: Device placement string passed to ``from_pretrained``
             (e.g. ``"auto"``, ``"cuda:0"``).
+        max_input_tokens: Hard cap on the number of input tokens.  Prompts
+            exceeding this are truncated from the *middle* of the chat history
+            (keeping the first user message and recent exchanges).
 
     Raises:
         ImportError: If ``transformers`` is not installed.
@@ -39,6 +63,7 @@ class HuggingFaceProvider(BaseProvider):
         model_name: str,
         quantization: str | None = None,
         device_map: str = "auto",
+        max_input_tokens: int = _MAX_INPUT_TOKENS,
     ) -> None:
         if quantization not in self._VALID_QUANTIZATIONS:
             raise ValueError(
@@ -52,6 +77,7 @@ class HuggingFaceProvider(BaseProvider):
             ) from exc
 
         self._model_name = model_name
+        self._max_input_tokens = max_input_tokens
         logger.info(
             "HuggingFaceProvider: loading model=%s quantization=%s device_map=%s",
             model_name,
@@ -77,9 +103,6 @@ class HuggingFaceProvider(BaseProvider):
             model_name, **kwargs
         )
         self._model.eval()
-        # Reset model's default sampling params to their neutral values so that
-        # greedy decoding (do_sample=False) does not trigger a transformers
-        # UserWarning about ignored temperature/top_p/top_k defaults.
         if hasattr(self._model, "generation_config"):
             self._model.generation_config.temperature = 1.0
             self._model.generation_config.top_p = 1.0
@@ -91,6 +114,107 @@ class HuggingFaceProvider(BaseProvider):
     def model_id(self) -> str:
         return self._model_name
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _chat_to_prompt(
+        self,
+        chat: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+    ) -> str:
+        """Apply the tokenizer chat template, falling back to naive concat."""
+        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        if tools:
+            kwargs["tools"] = tools
+
+        def _try(**extra: Any) -> str:
+            try:
+                return self._tokenizer.apply_chat_template(chat, **{**kwargs, **extra})
+            except TypeError:
+                extra.pop("enable_thinking", None)
+                return self._tokenizer.apply_chat_template(chat, **{**kwargs, **extra})
+
+        try:
+            return _try(enable_thinking=False)
+        except Exception:
+            pass
+        try:
+            return _try()
+        except Exception:
+            return "\n".join(
+                f"{m['role'].upper()}: {m.get('content', '')}" for m in chat
+            ) + "\nASSISTANT:"
+
+    def _tokenize(self, prompt: str) -> "torch.Tensor":  # type: ignore[name-defined]
+        import torch  # type: ignore[import]
+        inputs = self._tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        device = next(self._model.parameters()).device
+        return inputs["input_ids"].to(device), inputs.get("attention_mask", None)
+
+    def _trim_chat_to_token_budget(
+        self,
+        chat: list[dict[str, Any]],
+        budget: int,
+        tools: list[dict] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Drop middle messages until the chat fits in *budget* tokens.
+
+        Always keeps the first message (anchor / summary context) and the
+        most recent *_OOM_TRIM_KEEP_MESSAGES* messages so the model retains
+        its immediate conversational context.
+        """
+        if len(chat) <= 2:
+            return chat
+
+        while len(chat) > 2:
+            prompt = self._chat_to_prompt(chat, tools)
+            ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            if len(ids) <= budget:
+                break
+            # Drop the second message (oldest non-anchor) to shrink context.
+            if len(chat) <= _OOM_TRIM_KEEP_MESSAGES + 1:
+                # Can't trim further; return what we have and let the model try.
+                logger.warning(
+                    "HuggingFaceProvider: cannot trim below %d messages and %d tokens",
+                    len(chat), len(ids),
+                )
+                break
+            removed = chat.pop(1)
+            logger.debug(
+                "HuggingFaceProvider._trim_chat: removed message role=%s len=%d tokens",
+                removed.get("role"), len(ids),
+            )
+        return chat
+
+    def _run_generate(
+        self,
+        input_ids: "torch.Tensor",  # type: ignore[name-defined]
+        attention_mask: "torch.Tensor | None",  # type: ignore[name-defined]
+        max_tokens: int,
+        temperature: float,
+    ) -> "torch.Tensor":  # type: ignore[name-defined]
+        """Forward pass with explicit gen_kwargs. Does NOT handle OOM."""
+        import torch  # type: ignore[import]
+
+        do_sample = temperature > 0.0
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+
+        with torch.inference_mode():
+            return self._model.generate(input_ids, **gen_kwargs)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def generate_batch(
         self,
         batch_messages: list[list[dict[str, str]]],
@@ -100,9 +224,7 @@ class HuggingFaceProvider(BaseProvider):
     ) -> list[str]:
         """Generate responses for a batch of message lists in a single forward pass.
 
-        Left-pads all sequences to the same length so the batch fits in a single
-        ``model.generate()`` call, amortising CUDA launch and Python overhead across
-        the entire batch.  Falls back to sequential calls if batch size is 1.
+        Falls back to sequential calls on OOM.
 
         Args:
             batch_messages: List of message lists, one per item in the batch.
@@ -125,17 +247,8 @@ class HuggingFaceProvider(BaseProvider):
             if system:
                 chat.append({"role": "system", "content": system})
             chat.extend(normalize_messages(messages))
-            try:
-                prompt = self._tokenizer.apply_chat_template(
-                    chat, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                prompt = "\n".join(
-                    f"{m['role'].upper()}: {m['content']}" for m in chat
-                ) + "\nASSISTANT:"
-            prompts.append(prompt)
+            prompts.append(self._chat_to_prompt(chat))
 
-        # Left-pad for decoder-only batch generation.
         orig_padding_side = self._tokenizer.padding_side
         self._tokenizer.padding_side = "left"
         if self._tokenizer.pad_token_id is None:
@@ -157,21 +270,9 @@ class HuggingFaceProvider(BaseProvider):
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
 
-        do_sample = temperature > 0.0
-        gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_tokens,
-            "do_sample": do_sample,
-            "pad_token_id": self._tokenizer.eos_token_id,
-        }
-        if attention_mask is not None:
-            gen_kwargs["attention_mask"] = attention_mask
-        if do_sample:
-            gen_kwargs["temperature"] = temperature
-
         input_len = input_ids.shape[-1]
         try:
-            with torch.inference_mode():
-                output_ids = self._model.generate(input_ids, **gen_kwargs)
+            output_ids = self._run_generate(input_ids, attention_mask, max_tokens, temperature)
         except torch.cuda.OutOfMemoryError:
             logger.warning(
                 "generate_batch: OOM on batch_size=%d input_len=%d — falling back to sequential",
@@ -180,9 +281,7 @@ class HuggingFaceProvider(BaseProvider):
             del input_ids
             if attention_mask is not None:
                 del attention_mask
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            _flush_cuda()
             return [
                 self.generate(msgs, system=system, max_tokens=max_tokens,
                                temperature=temperature)
@@ -198,9 +297,7 @@ class HuggingFaceProvider(BaseProvider):
         del input_ids, output_ids
         if attention_mask is not None:
             del attention_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        _flush_cuda()
 
         return results
 
@@ -213,6 +310,9 @@ class HuggingFaceProvider(BaseProvider):
     ) -> str:
         """Generate a response from the local model.
 
+        On ``OutOfMemoryError`` the context is trimmed to the last
+        ``_OOM_TRIM_KEEP_MESSAGES`` messages and retried once.
+
         Args:
             messages: Alternating user/assistant strings or chat-message dicts.
             system: Optional system prompt prepended as a system-role message.
@@ -223,63 +323,49 @@ class HuggingFaceProvider(BaseProvider):
             The assistant's text response (decoded and stripped).
 
         Raises:
-            RuntimeError: If generation fails.
+            torch.cuda.OutOfMemoryError: If OOM persists after trimming.
         """
         import torch  # type: ignore[import]
 
-        chat: list[dict[str, str]] = []
+        chat: list[dict[str, Any]] = []
         if system:
             chat.append({"role": "system", "content": system})
         chat.extend(normalize_messages(messages))
 
+        chat = self._trim_chat_to_token_budget(chat, self._max_input_tokens)
+        prompt = self._chat_to_prompt(chat)
+
+        input_ids, attention_mask = self._tokenize(prompt)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(input_ids.device)
+
         try:
-            prompt: str = self._tokenizer.apply_chat_template(
-                chat,
-                tokenize=False,
-                add_generation_prompt=True,
+            output_ids = self._run_generate(input_ids, attention_mask, max_tokens, temperature)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "generate: OOM on input_len=%d — trimming to last %d messages and retrying",
+                input_ids.shape[-1], _OOM_TRIM_KEEP_MESSAGES,
             )
-        except Exception:
-            # Fallback: concatenate messages naively.
-            prompt = "\n".join(
-                f"{m['role'].upper()}: {m['content']}" for m in chat
-            ) + "\nASSISTANT:"
+            del input_ids
+            if attention_mask is not None:
+                del attention_mask
+            _flush_cuda()
 
-        inputs = self._tokenizer(
-            prompt,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        device = next(self._model.parameters()).device
-        input_ids = inputs["input_ids"].to(device)
-        # Pass attention_mask explicitly to suppress the pad==eos UserWarning.
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-
-        do_sample = temperature > 0.0
-        gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_tokens,
-            "do_sample": do_sample,
-            "pad_token_id": self._tokenizer.eos_token_id,
-        }
-        if attention_mask is not None:
-            gen_kwargs["attention_mask"] = attention_mask
-        if do_sample:
-            gen_kwargs["temperature"] = temperature
-
-        with torch.inference_mode():
-            output_ids = self._model.generate(input_ids, **gen_kwargs)
+            # Trim to system + last N messages and retry.
+            trimmed = _keep_system_and_tail(chat, _OOM_TRIM_KEEP_MESSAGES)
+            prompt = self._chat_to_prompt(trimmed)
+            input_ids, attention_mask = self._tokenize(prompt)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(input_ids.device)
+            output_ids = self._run_generate(input_ids, attention_mask, max_tokens, temperature)
 
         new_ids = output_ids[0][input_ids.shape[-1]:]
         text: str = self._tokenizer.decode(new_ids, skip_special_tokens=True)
 
-        # Explicitly free GPU memory for the intermediate tensors.
         del input_ids, output_ids, new_ids
         if attention_mask is not None:
             del attention_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        _flush_cuda()
 
         return text.strip()
 
@@ -291,11 +377,13 @@ class HuggingFaceProvider(BaseProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> dict[str, Any]:
-        """Run one inference step with tool-calling support for Qwen2.5-Instruct.
+        """Run one inference step with tool-calling support for Qwen2.5/3-Instruct.
 
         Uses ``apply_chat_template`` with the ``tools=`` parameter so that
-        Qwen2.5-Instruct models emit structured ``<tool_call>`` blocks when
+        Qwen-Instruct models emit structured ``<tool_call>`` blocks when
         they want to invoke a function.
+
+        On ``OutOfMemoryError`` the context is trimmed and retried once.
 
         The output is parsed as follows:
 
@@ -303,15 +391,14 @@ class HuggingFaceProvider(BaseProvider):
           payload is extracted and returned as a ``type="tool_call"`` response.
         - Otherwise the text is returned as a ``type="text"`` response.
 
-        The ``raw_message`` field in the returned dict is always a complete
-        assistant message dict ready to be appended to *messages* before the
-        next call.  Tool result messages must use the Qwen-native format::
+        The ``raw_message`` field is always a complete assistant message dict
+        ready to be appended to *messages* before the next call.  Tool result
+        messages must use the Qwen-native format::
 
             {"role": "tool", "content": <result_str>, "name": <tool_name>}
 
         Args:
             messages: Full conversation history as standard chat-message dicts.
-                Tool result turns should follow the Qwen tool-result format.
             tools: List of OpenAI-format tool schema dicts.
             system: Optional system prompt.
             max_tokens: Maximum new tokens to generate.
@@ -319,12 +406,11 @@ class HuggingFaceProvider(BaseProvider):
 
         Returns:
             Dict with keys ``"type"``, ``"content"``, ``"tool_name"``,
-            ``"tool_args"``, and ``"raw_message"``.  See
-            :meth:`~episodic_log.providers.base.BaseProvider.generate_with_tools`
-            for the full contract.
+            ``"tool_args"``, and ``"raw_message"``.
 
         Raises:
-            RuntimeError: If generation or JSON parsing of a tool call fails.
+            RuntimeError: If JSON parsing of a tool call fails.
+            torch.cuda.OutOfMemoryError: If OOM persists after trimming.
         """
         import torch  # type: ignore[import]
 
@@ -333,60 +419,36 @@ class HuggingFaceProvider(BaseProvider):
             chat.append({"role": "system", "content": system})
         chat.extend(messages)
 
-        def _apply_template(**kwargs: Any) -> str:
-            """Apply chat template with graceful degradation for unsupported kwargs."""
-            try:
-                return self._tokenizer.apply_chat_template(
-                    chat, tokenize=False, add_generation_prompt=True, **kwargs
-                )
-            except TypeError:
-                # Older tokenizers (e.g. Qwen2.5) don't accept enable_thinking.
-                kwargs.pop("enable_thinking", None)
-                return self._tokenizer.apply_chat_template(
-                    chat, tokenize=False, add_generation_prompt=True, **kwargs
-                )
+        # Pre-emptively trim if already over budget before we even try.
+        chat = self._trim_chat_to_token_budget(chat, self._max_input_tokens, tools)
+        prompt = self._chat_to_prompt(chat, tools)
+
+        input_ids, attention_mask = self._tokenize(prompt)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(input_ids.device)
 
         try:
-            # enable_thinking=False: skip Qwen3's chain-of-thought reasoning so the
-            # agent loop doesn't burn its token budget on <think> blocks per call.
-            prompt: str = _apply_template(tools=tools, enable_thinking=False)
-        except Exception as exc:
+            output_ids = self._run_generate(input_ids, attention_mask, max_tokens, temperature)
+        except torch.cuda.OutOfMemoryError:
             logger.warning(
-                "generate_with_tools: apply_chat_template with tools failed (%s); "
-                "falling back to tool-schema-free template.",
-                exc,
+                "generate_with_tools: OOM on input_len=%d — trimming context and retrying",
+                input_ids.shape[-1],
             )
-            try:
-                prompt = _apply_template(enable_thinking=False)
-            except Exception:
-                prompt = "\n".join(
-                    f"{m['role'].upper()}: {m['content']}" for m in chat
-                ) + "\nASSISTANT:"
+            del input_ids
+            if attention_mask is not None:
+                del attention_mask
+            _flush_cuda()
 
-        inputs = self._tokenizer(
-            prompt,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        device = next(self._model.parameters()).device
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-
-        do_sample = temperature > 0.0
-        gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_tokens,
-            "do_sample": do_sample,
-            "pad_token_id": self._tokenizer.eos_token_id,
-        }
-        if attention_mask is not None:
-            gen_kwargs["attention_mask"] = attention_mask
-        if do_sample:
-            gen_kwargs["temperature"] = temperature
-
-        with torch.inference_mode():
-            output_ids = self._model.generate(input_ids, **gen_kwargs)
+            trimmed = _keep_system_and_tail(chat, _OOM_TRIM_KEEP_MESSAGES)
+            prompt = self._chat_to_prompt(trimmed, tools)
+            input_ids, attention_mask = self._tokenize(prompt)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(input_ids.device)
+            logger.info(
+                "generate_with_tools: retrying with trimmed context input_len=%d",
+                input_ids.shape[-1],
+            )
+            output_ids = self._run_generate(input_ids, attention_mask, max_tokens, temperature)
 
         new_ids = output_ids[0][input_ids.shape[-1]:]
         raw_text: str = self._tokenizer.decode(new_ids, skip_special_tokens=True).strip()
@@ -394,15 +456,9 @@ class HuggingFaceProvider(BaseProvider):
         del input_ids, output_ids, new_ids
         if attention_mask is not None:
             del attention_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        _flush_cuda()
 
-        # ------------------------------------------------------------------ #
-        # Parse tool call vs. plain text                                       #
-        # Qwen3 prepends <think>...</think> blocks; strip them before parsing  #
-        # so that tool_call detection is not confused by reasoning content.   #
-        # ------------------------------------------------------------------ #
+        # Strip Qwen3 <think>...</think> blocks before parsing tool calls.
         parse_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
 
         tool_call_match = re.search(
@@ -425,14 +481,10 @@ class HuggingFaceProvider(BaseProvider):
             if not isinstance(tool_args, dict):
                 tool_args = {}
 
-            raw_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": raw_text,
-            }
+            raw_message: dict[str, Any] = {"role": "assistant", "content": raw_text}
             logger.debug(
                 "generate_with_tools: tool_call detected name=%s args=%s",
-                tool_name,
-                tool_args,
+                tool_name, tool_args,
             )
             return {
                 "type": "tool_call",
@@ -442,9 +494,6 @@ class HuggingFaceProvider(BaseProvider):
                 "raw_message": raw_message,
             }
 
-        # Plain text response — the model has produced a final answer.
-        # Use parse_text (thinking stripped) as the actual answer content so
-        # downstream components don't receive raw <think> blocks.
         raw_message = {"role": "assistant", "content": raw_text}
         logger.debug("generate_with_tools: text response len=%d", len(parse_text))
         return {
@@ -454,6 +503,21 @@ class HuggingFaceProvider(BaseProvider):
             "tool_args": {},
             "raw_message": raw_message,
         }
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _keep_system_and_tail(
+    chat: list[dict[str, Any]],
+    keep_tail: int,
+) -> list[dict[str, Any]]:
+    """Return system message (if any) + the last *keep_tail* messages."""
+    system_msgs = [m for m in chat if m.get("role") == "system"]
+    non_system = [m for m in chat if m.get("role") != "system"]
+    tail = non_system[-keep_tail:] if len(non_system) > keep_tail else non_system
+    return system_msgs + tail
 
 
 def _build_bnb_config(quantization: str | None) -> Any | None:

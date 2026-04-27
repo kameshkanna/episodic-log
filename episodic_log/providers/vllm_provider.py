@@ -169,6 +169,15 @@ class VLLMProvider(BaseProvider):
         )
 
         logger.info("VLLMProvider.generate_batch: %d prompts", len(prompts))
+        # vLLM manages its own KV-cache; prompts that exceed max_model_len are
+        # silently truncated by vLLM.  Log a warning for any extremely long prompt.
+        long_prompts = sum(1 for p in prompts if len(p) > 60_000)
+        if long_prompts:
+            logger.warning(
+                "VLLMProvider.generate_batch: %d/%d prompts exceed 60k chars — "
+                "vLLM will truncate to max_model_len=%d",
+                long_prompts, len(prompts), self._llm.llm_engine.model_config.max_model_len,
+            )
         outputs = self._llm.generate(prompts, params)
         return [o.outputs[0].text.strip() for o in outputs]
 

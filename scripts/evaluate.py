@@ -290,9 +290,29 @@ def _run_worker(
             try:
                 result = cond.run(session_meta=meta, provider=provider)
             except Exception as exc:
-                worker_logger.error(
-                    "Session %s failed: %s", meta.get("session_id"), exc, exc_info=True
+                _is_oom = (
+                    "OutOfMemoryError" in type(exc).__name__
+                    or "out of memory" in str(exc).lower()
+                    or "CUDA out of memory" in str(exc)
                 )
+                if _is_oom:
+                    worker_logger.error(
+                        "Session %s OOM — flushing cache and continuing. Error: %s",
+                        meta.get("session_id"), exc,
+                    )
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+                    import gc as _gc
+                    _gc.collect()
+                else:
+                    worker_logger.error(
+                        "Session %s failed: %s", meta.get("session_id"), exc, exc_info=True
+                    )
                 failed += 1
                 bar.set_postfix({"written": written, "failed": failed})
                 continue
