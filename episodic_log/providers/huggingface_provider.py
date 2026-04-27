@@ -158,33 +158,55 @@ class HuggingFaceProvider(BaseProvider):
         budget: int,
         tools: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
-        """Drop middle messages until the chat fits in *budget* tokens.
+        """Drop (assistant, tool) exchange pairs until the chat fits in *budget* tokens.
 
-        Always keeps the first message (anchor / summary context) and the
-        most recent *_OOM_TRIM_KEEP_MESSAGES* messages so the model retains
-        its immediate conversational context.
+        The anchor (first non-system message — the summary context) is always
+        kept.  The most recent *_OOM_TRIM_KEEP_MESSAGES* messages are also kept.
+        Old exchanges between the anchor and the tail are removed as atomic pairs
+        so the chat history is never left with an orphaned tool message.
         """
         if len(chat) <= 2:
             return chat
 
-        while len(chat) > 2:
+        # Index of the first non-system message (anchor — never dropped).
+        anchor_idx: int = 1 if (chat and chat[0].get("role") == "system") else 0
+        drop_start: int = anchor_idx + 1
+
+        while True:
             prompt = self._chat_to_prompt(chat, tools)
             ids = self._tokenizer(prompt, add_special_tokens=False)["input_ids"]
             if len(ids) <= budget:
                 break
-            # Drop the second message (oldest non-anchor) to shrink context.
-            if len(chat) <= _OOM_TRIM_KEEP_MESSAGES + 1:
-                # Can't trim further; return what we have and let the model try.
+            if len(chat) <= anchor_idx + 1 + _OOM_TRIM_KEEP_MESSAGES:
                 logger.warning(
                     "HuggingFaceProvider: cannot trim below %d messages and %d tokens",
                     len(chat), len(ids),
                 )
                 break
-            removed = chat.pop(1)
-            logger.debug(
-                "HuggingFaceProvider._trim_chat: removed message role=%s len=%d tokens",
-                removed.get("role"), len(ids),
-            )
+            # Find and atomically remove the oldest (assistant [+ tool]) exchange.
+            dropped = False
+            for i in range(drop_start, len(chat)):
+                if chat[i].get("role") == "assistant":
+                    end = (
+                        i + 2
+                        if i + 1 < len(chat) and chat[i + 1].get("role") == "tool"
+                        else i + 1
+                    )
+                    removed_roles = [m.get("role") for m in chat[i:end]]
+                    del chat[i:end]
+                    logger.debug(
+                        "HuggingFaceProvider._trim_chat: dropped exchange "
+                        "at idx=%d roles=%s remaining=%d",
+                        i, removed_roles, len(chat),
+                    )
+                    dropped = True
+                    break
+            if not dropped:
+                logger.warning(
+                    "HuggingFaceProvider._trim_chat: no droppable exchanges found "
+                    "(len=%d) — giving up", len(chat),
+                )
+                break
         return chat
 
     def _run_generate(
