@@ -164,13 +164,11 @@ Step 2a summarize.py        CPU        ~2 min   lexical summaries (no model)
 Step 2b summarize.py        vLLM tp4   ~5 min   scout (GPUs 0-3) + echo (GPUs 4-7) in parallel
                                                  Each skipped independently if already complete
 
-Step 3  evaluate.py         HF BF16    ~45 min  10 conditions in 3 waves
-         Wave 1             Qwen3-32B           amnesiac + recall × 3
-                            2× H100/worker      GPUs 0-1 / 2-3 / 4-5 / 6-7 (parallel)
-         Wave 2                                 grep_recall × 3 + topk/lexical/k5
-                                                GPUs 0-1 / 2-3 / 4-5 / 6-7 (parallel)
-         Wave 3                                 topk/scout/k5 + topk/echo/k5
-                                                GPUs 0-1 / 2-3 (parallel)
+Step 3  evaluate.py         vLLM BF16  ~45 min  10 conditions in 2 waves
+         Wave 1             Qwen3-32B           amnesiac + recall×3 + grep_recall×3 +
+                            1× H100/worker      topk/lexical/k5 — 8 workers × 1 GPU (parallel)
+         Wave 2                                 topk/scout/k5 + topk/echo/k5
+                                                GPUs 0,1 (parallel)
 
 Step 4  judge.py            vLLM tp8   ~5 min   all verdicts in one generate() call
 Step 5  score.py            CPU        <1 min   print results table
@@ -361,7 +359,7 @@ Result row schema:
 |---|---|
 | Groq-only (no GPU) | Any CPU |
 | Summarize + judge (vLLM) | 1× H100 80 GB |
-| Single condition eval — Qwen3-32B BF16 | 2× H100 80 GB (tp2, device_map=auto) |
+| Single condition eval — Qwen3-32B BF16 | 1× H100 80 GB (vLLM tp1) |
 | Full parallel pipeline (2 waves × 4 conditions) | 8× H100 80 GB |
 
 ---

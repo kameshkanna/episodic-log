@@ -1,16 +1,20 @@
-"""vLLM offline batch provider for maximum summarization throughput.
+"""vLLM offline provider — batch summarization + single-step tool-calling.
 
-Uses vLLM's PagedAttention + continuous batching to process hundreds of
-thousands of prompts in a single pass, achieving 5-10x the throughput of
-naive HuggingFace ``model.generate()``.
+Uses vLLM's PagedAttention + continuous batching for maximum throughput.
+``generate_batch`` processes hundreds of prompts in one pass.
+``generate_with_tools`` runs one agent step via vLLM's fast single-prompt path,
+using ``apply_chat_template(tools=...)`` + Qwen ``<tool_call>`` parsing — the
+same contract as HuggingFaceProvider so the agent loop works with either backend.
 
-Provider spec: ``vllm:<model_id>`` or ``vllm:<model_id>:tp4``
+Provider spec: ``vllm:<model_id>`` or ``vllm:<model_id>:tp2`` etc.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any
 
 from episodic_log.providers.base import BaseProvider, normalize_messages
@@ -19,20 +23,19 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMProvider(BaseProvider):
-    """Offline batch LLM provider backed by vLLM.
+    """Offline LLM provider backed by vLLM.
 
-    Loads the model once with tensor parallelism across *tensor_parallel_size*
-    GPUs.  All calls to :meth:`generate_batch` feed prompts directly to
-    ``vllm.LLM.generate()`` — vLLM schedules them with PagedAttention and
-    continuous batching, saturating GPU memory bandwidth at all times.
+    Supports both batch inference (summarization, judging) and interactive
+    tool-calling (evaluation agent loop) on the same loaded model.
 
     Args:
         model_name: HuggingFace model ID or local path.
         tensor_parallel_size: Number of GPUs for tensor parallelism.
-            Use 4 for 7B/14B on 4 H100s; 8 for maximum throughput.
-        gpu_memory_utilization: Fraction of GPU VRAM to reserve for KV cache
-            (default 0.92 leaves headroom for activations).
+            tp=1 fits Qwen3-32B BF16 on a single 80 GB H100 (64 GB weights +
+            ~12 GB KV cache at max_model_len=32768).
+        gpu_memory_utilization: Fraction of VRAM reserved for KV cache.
         max_model_len: Maximum sequence length (input + output tokens).
+            32768 is safe for Qwen3-32B on a single 80 GB H100.
 
     Raises:
         ImportError: If ``vllm`` is not installed.
@@ -43,7 +46,7 @@ class VLLMProvider(BaseProvider):
         model_name: str,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.92,
-        max_model_len: int = 4096,
+        max_model_len: int = 32_768,
     ) -> None:
         try:
             from vllm import LLM, SamplingParams  # type: ignore[import]
@@ -52,7 +55,7 @@ class VLLMProvider(BaseProvider):
                 raise ImportError(
                     "vllm is required. Install with: pip install vllm"
                 ) from exc
-            raise  # re-raise transitive errors (e.g. scipy/numpy incompatibility) as-is
+            raise
 
         try:
             from transformers import AutoTokenizer  # type: ignore[import]
@@ -64,12 +67,10 @@ class VLLMProvider(BaseProvider):
         self._model_name = model_name
         self._tp = tensor_parallel_size
         logger.info(
-            "VLLMProvider: loading model=%s tp=%d gpu_mem_util=%.2f",
-            model_name, tensor_parallel_size, gpu_memory_utilization,
+            "VLLMProvider: loading model=%s tp=%d gpu_mem_util=%.2f max_model_len=%d",
+            model_name, tensor_parallel_size, gpu_memory_utilization, max_model_len,
         )
 
-        # vLLM reads HF_TOKEN from the environment automatically for model downloads.
-        # Mirror it to HUGGING_FACE_HUB_TOKEN (the older env var) so both are set.
         hf_token: str | None = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         if hf_token and not os.environ.get("HUGGING_FACE_HUB_TOKEN"):
             os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
@@ -93,23 +94,54 @@ class VLLMProvider(BaseProvider):
     def model_id(self) -> str:
         return self._model_name
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _build_prompt(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         system: str | None,
+        tools: list[dict] | None = None,
     ) -> str:
-        chat: list[dict[str, str]] = []
+        """Apply the tokenizer chat template, with optional tool schema injection."""
+        chat: list[dict[str, Any]] = []
         if system:
             chat.append({"role": "system", "content": system})
-        chat.extend(normalize_messages(messages))
+        chat.extend(normalize_messages(messages))  # type: ignore[arg-type]
+
+        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        if tools:
+            kwargs["tools"] = tools
+
+        def _try(**extra: Any) -> str:
+            try:
+                return self._tokenizer.apply_chat_template(chat, **{**kwargs, **extra})
+            except TypeError:
+                extra.pop("enable_thinking", None)
+                return self._tokenizer.apply_chat_template(chat, **{**kwargs, **extra})
+
         try:
-            return self._tokenizer.apply_chat_template(
-                chat, tokenize=False, add_generation_prompt=True
-            )
+            return _try(enable_thinking=False)
+        except Exception:
+            pass
+        try:
+            return _try()
         except Exception:
             return "\n".join(
-                f"{m['role'].upper()}: {m['content']}" for m in chat
+                f"{m['role'].upper()}: {m.get('content', '')}" for m in chat
             ) + "\nASSISTANT:"
+
+    def _sampling_params(self, max_tokens: int, temperature: float) -> Any:
+        return self._SamplingParams(
+            max_tokens=max_tokens,
+            temperature=max(temperature, 1e-6) if temperature > 0 else 0.0,
+            top_p=1.0,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -143,13 +175,11 @@ class VLLMProvider(BaseProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> list[str]:
-        """Generate responses for an arbitrarily large batch of message lists.
+        """Generate responses for a large batch in a single vLLM pass.
 
-        All prompts are submitted to ``vllm.LLM.generate()`` in a single call.
-        vLLM's continuous batching scheduler saturates GPU memory bandwidth
-        regardless of the number of prompts.  There is no practical limit on
-        ``len(batch_messages)`` — pass the entire dataset at once for maximum
-        throughput.
+        All prompts are submitted to ``vllm.LLM.generate()`` at once.
+        vLLM's continuous batching saturates GPU memory bandwidth regardless
+        of batch size — pass the entire dataset for maximum throughput.
 
         Args:
             batch_messages: One message list per item.
@@ -160,17 +190,11 @@ class VLLMProvider(BaseProvider):
         Returns:
             List of response strings in the same order as *batch_messages*.
         """
-        prompts = [self._build_prompt(msgs, system) for msgs in batch_messages]
+        prompts = [self._build_prompt(msgs, system) for msgs in batch_messages]  # type: ignore[arg-type]
 
-        params = self._SamplingParams(
-            max_tokens=max_tokens,
-            temperature=max(temperature, 1e-6) if temperature > 0 else 0.0,
-            top_p=1.0,
-        )
+        params = self._sampling_params(max_tokens, temperature)
 
         logger.info("VLLMProvider.generate_batch: %d prompts", len(prompts))
-        # vLLM manages its own KV-cache; prompts that exceed max_model_len are
-        # silently truncated by vLLM.  Log a warning for any extremely long prompt.
         long_prompts = sum(1 for p in prompts if len(p) > 60_000)
         if long_prompts:
             logger.warning(
@@ -189,17 +213,74 @@ class VLLMProvider(BaseProvider):
         max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> dict[str, Any]:
-        """Not implemented for vLLM offline provider.
+        """Run one tool-calling agent step via vLLM's fast single-prompt path.
 
-        Tool-calling requires the HuggingFace provider with
-        ``apply_chat_template(tools=...)``.  Use
-        :class:`~episodic_log.providers.HuggingFaceProvider` for evaluation
-        conditions that require tool-use.
+        Uses ``apply_chat_template(tools=...)`` for prompt construction and
+        parses Qwen-native ``<tool_call>...</tool_call>`` blocks from the
+        output — identical contract to :class:`HuggingFaceProvider` so the
+        agent loop works transparently with either backend.
+
+        Args:
+            messages: Full conversation history as chat-message dicts.
+            tools: List of OpenAI-format tool schema dicts.
+            system: Optional system prompt.
+            max_tokens: Maximum new tokens to generate.
+            temperature: Sampling temperature; 0.0 = greedy.
+
+        Returns:
+            Dict with keys ``"type"``, ``"content"``, ``"tool_name"``,
+            ``"tool_args"``, and ``"raw_message"`` — same schema as
+            :meth:`HuggingFaceProvider.generate_with_tools`.
 
         Raises:
-            NotImplementedError: Always.
+            RuntimeError: If the tool_call JSON payload cannot be parsed.
         """
-        raise NotImplementedError(
-            "VLLMProvider does not support tool-calling. "
-            "Use HuggingFaceProvider for recall/agent conditions."
+        prompt = self._build_prompt(messages, system, tools)
+        params = self._sampling_params(max_tokens, temperature)
+
+        outputs = self._llm.generate([prompt], params)
+        raw_text: str = outputs[0].outputs[0].text.strip()
+
+        # Strip Qwen3 <think>...</think> blocks before parsing.
+        parse_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+
+        tool_call_match = re.search(
+            r"<tool_call>\s*(.*?)\s*</tool_call>",
+            parse_text,
+            re.DOTALL,
         )
+        if tool_call_match:
+            payload_str = tool_call_match.group(1)
+            try:
+                payload: dict[str, Any] = json.loads(payload_str)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"VLLMProvider.generate_with_tools: failed to parse tool_call JSON: {exc}\n"
+                    f"Raw payload: {payload_str!r}"
+                ) from exc
+
+            tool_name: str = payload.get("name", "")
+            tool_args: dict[str, Any] = payload.get("arguments", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            logger.debug(
+                "VLLMProvider.generate_with_tools: tool_call name=%s args=%s",
+                tool_name, tool_args,
+            )
+            return {
+                "type": "tool_call",
+                "content": "",
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "raw_message": {"role": "assistant", "content": raw_text},
+            }
+
+        logger.debug("VLLMProvider.generate_with_tools: text response len=%d", len(parse_text))
+        return {
+            "type": "text",
+            "content": parse_text,
+            "tool_name": "",
+            "tool_args": {},
+            "raw_message": {"role": "assistant", "content": raw_text},
+        }
