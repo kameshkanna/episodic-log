@@ -97,3 +97,34 @@ class AmnesiacCondition(BaseCondition):
             tool_calls=[],
             turns_loaded=[],
         )
+
+    def run_batch(
+        self, sessions: list[dict], provider: BaseProvider
+    ) -> list[ConditionResult]:
+        """Answer all sessions in one generate_batch call.
+
+        Args:
+            sessions: List of session metadata dicts.
+            provider: Initialised LLM provider with ``generate_batch``.
+
+        Returns:
+            Ordered list of :class:`ConditionResult`.
+        """
+        messages = [[{"role": "user", "content": s["question"]}] for s in sessions]
+        answers = provider.generate_batch(
+            messages, system=self.SYSTEM_PROMPT, max_tokens=256, temperature=0.0
+        )
+        return [
+            ConditionResult(
+                session_id=s["session_id"],
+                question_id=s["question_id"],
+                question=s["question"],
+                ground_truth=s["answer"],
+                predicted_answer=a.strip(),
+                condition=self.name,
+                summary_method=None,
+                tool_calls=[],
+                turns_loaded=[],
+            )
+            for s, a in zip(sessions, answers)
+        ]

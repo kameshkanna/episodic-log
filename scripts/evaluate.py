@@ -362,6 +362,54 @@ def _run_worker(
         )
         return
 
+    # ── Oneshot batch: amnesiac / topk — single generate_batch call ──────────
+    # Conditions that implement run_batch() submit all sessions in one LLM call.
+    # No tool loop, no iteration — pure batch inference on the whole session set.
+    _use_oneshot_batch = (
+        hasattr(cond, "run_batch")
+        and hasattr(provider, "generate_batch")
+        and not condition.startswith(("recall/", "grep_recall/"))
+    )
+
+    if _use_oneshot_batch:
+        worker_logger.info(
+            "%s: oneshot-batch mode — %d sessions, condition=%s",
+            tag, len(sessions), condition,
+        )
+        try:
+            results = cond.run_batch(sessions, provider)
+        except Exception as exc:
+            worker_logger.error(
+                "%s: run_batch failed: %s", tag, exc, exc_info=True,
+            )
+            results = []
+
+        with shard_path.open("w", encoding="utf-8") as fh:
+            for meta, result in zip(sessions, results):
+                record = {
+                    "session_id": result.session_id,
+                    "question_id": result.question_id,
+                    "condition": result.condition,
+                    "summary_method": result.summary_method,
+                    "question": result.question,
+                    "ground_truth": result.ground_truth,
+                    "predicted_answer": result.predicted_answer,
+                    "tool_calls": result.tool_calls,
+                    "turns_loaded": result.turns_loaded,
+                    "evidence_turn_ids": meta.get("evidence_turn_ids", []),
+                    "question_type": meta.get("question_type", ""),
+                    "verdict": None,
+                    "confidence": None,
+                    "judge_reason": None,
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                written += 1
+
+        worker_logger.info(
+            "%s: oneshot-batch done — written=%d  total=%d", tag, written, len(sessions),
+        )
+        return
+
     # ── Sequential path: HuggingFace or single-session vLLM ─────────────────
     with shard_path.open("w", encoding="utf-8") as fh:
         for meta in bar:

@@ -17,9 +17,10 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 JUDGE_MODEL="${JUDGE_MODEL:-vllm:Qwen/Qwen2.5-14B-Instruct:tp8}"
-# vLLM tp1: Qwen3-32B fits in one 80GB H100 (64GB weights + ~12GB KV cache).
-# 8 independent single-GPU workers instead of 4 two-GPU workers → ~3-4x faster.
-EVAL_MODEL="${EVAL_MODEL:-vllm:Qwen/Qwen3-32B:tp1}"
+# vLLM tp8: all 8 H100s on one model instance — huge batches, low per-step latency.
+# Each condition runs sequentially with all 500 sessions in a single generate_batch
+# or batch_loop call.  Matches the summarizer throughput pattern.
+EVAL_MODEL="${EVAL_MODEL:-vllm:Qwen/Qwen3-32B:tp8}"
 LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
 
@@ -95,105 +96,39 @@ fi
 log "Summarization complete."
 
 # ---------------------------------------------------------------------------
-# STEP 3: Evaluate — 10 conditions in 2 waves, 1 GPU/worker (vLLM tp1)
-#         Qwen3-32B fits in a single 80GB H100 → 8 independent workers.
-#         Wave 1: 8 conditions × 1 GPU, all in parallel.
-#         Wave 2: 2 remaining topk conditions × 1 GPU.
+# STEP 3: Evaluate — 10 conditions, tp=8 serial (all 8 H100s, one at a time).
+#         Each condition submits ALL 500 sessions as one huge batch:
+#           amnesiac / topk → single generate_batch call (oneshot)
+#           recall / grep_recall → step-synchronised batch_loop
+#         No multi-process fan-out — vLLM tensor parallelism saturates all 8 GPUs.
 # ---------------------------------------------------------------------------
-log "=== STEP 3: Evaluate (2 waves, 1 GPU/worker × 8 workers, $EVAL_MODEL) ==="
+log "=== STEP 3: Evaluate (serial × 10 conditions, tp=8 batch, $EVAL_MODEL) ==="
 
 OVERWRITE_FLAG=""
 [[ -n "${FORCE_EVAL:-}" ]] && OVERWRITE_FLAG="--overwrite"
 
-# Wave 1: 8 conditions in parallel — 1 GPU each, all 8 H100s fully utilised.
-log "--- Wave 1: amnesiac + recall×3 + grep_recall×3 + topk/lexical/k5 (8 parallel) ---"
+_eval() {
+    local label="$1"; shift
+    log "--- $label ---"
+    python scripts/evaluate.py "$@" \
+        --provider "$EVAL_MODEL" \
+        --num-gpus 8 --gpus-per-worker 8 $OVERWRITE_FLAG \
+        2>&1 | tee "$LOG_DIR/eval_${label}.log"
+    local rc=$?
+    [[ $rc -ne 0 ]] && { log "ERROR: $label failed (exit $rc)"; exit $rc; }
+}
 
-CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
-    --condition amnesiac \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
-EVAL0_PID=$!
+_eval "amnesiac"              --condition amnesiac
+_eval "recall_lexical"        --condition recall      --summary-method lexical
+_eval "recall_scout"          --condition recall      --summary-method scout
+_eval "recall_echo"           --condition recall      --summary-method echo
+_eval "grep_recall_lexical"   --condition grep_recall --summary-method lexical
+_eval "grep_recall_scout"     --condition grep_recall --summary-method scout
+_eval "grep_recall_echo"      --condition grep_recall --summary-method echo
+_eval "topk_lexical_k5"       --condition topk        --summary-method lexical --retrieval-k 5
+_eval "topk_scout_k5"         --condition topk        --summary-method scout   --retrieval-k 5
+_eval "topk_echo_k5"          --condition topk        --summary-method echo    --retrieval-k 5
 
-CUDA_VISIBLE_DEVICES=1 python scripts/evaluate.py \
-    --condition recall --summary-method lexical \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
-EVAL1_PID=$!
-
-CUDA_VISIBLE_DEVICES=2 python scripts/evaluate.py \
-    --condition recall --summary-method scout \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
-EVAL2_PID=$!
-
-CUDA_VISIBLE_DEVICES=3 python scripts/evaluate.py \
-    --condition recall --summary-method echo \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
-EVAL3_PID=$!
-
-CUDA_VISIBLE_DEVICES=4 python scripts/evaluate.py \
-    --condition grep_recall --summary-method lexical \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_grep_recall_lexical.log" &
-EVAL4_PID=$!
-
-CUDA_VISIBLE_DEVICES=5 python scripts/evaluate.py \
-    --condition grep_recall --summary-method scout \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_grep_recall_scout.log" &
-EVAL5_PID=$!
-
-CUDA_VISIBLE_DEVICES=6 python scripts/evaluate.py \
-    --condition grep_recall --summary-method echo \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_grep_recall_echo.log" &
-EVAL6_PID=$!
-
-CUDA_VISIBLE_DEVICES=7 python scripts/evaluate.py \
-    --condition topk --summary-method lexical --retrieval-k 5 \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_topk_lexical_k5.log" &
-EVAL7_PID=$!
-
-wait $EVAL0_PID || { log "ERROR: amnesiac eval failed";         exit 1; }
-wait $EVAL1_PID || { log "ERROR: recall/lexical eval failed";   exit 1; }
-wait $EVAL2_PID || { log "ERROR: recall/scout eval failed";     exit 1; }
-wait $EVAL3_PID || { log "ERROR: recall/echo eval failed";      exit 1; }
-wait $EVAL4_PID || { log "ERROR: grep_recall/lexical failed";   exit 1; }
-wait $EVAL5_PID || { log "ERROR: grep_recall/scout failed";     exit 1; }
-wait $EVAL6_PID || { log "ERROR: grep_recall/echo failed";      exit 1; }
-wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 failed";       exit 1; }
-log "Wave 1 complete."
-
-# Wave 2: remaining topk variants (2 GPUs free after wave 1)
-log "--- Wave 2: topk/scout/k5 + topk/echo/k5 ---"
-
-CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
-    --condition topk --summary-method scout --retrieval-k 5 \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_topk_scout_k5.log" &
-EVAL8_PID=$!
-
-CUDA_VISIBLE_DEVICES=1 python scripts/evaluate.py \
-    --condition topk --summary-method echo --retrieval-k 5 \
-    --provider "$EVAL_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
-    2>&1 | tee "$LOG_DIR/eval_topk_echo_k5.log" &
-EVAL9_PID=$!
-
-wait $EVAL8_PID || { log "ERROR: topk/scout/k5 failed"; exit 1; }
-wait $EVAL9_PID || { log "ERROR: topk/echo/k5 failed";  exit 1; }
-log "Wave 2 complete."
 log "Evaluation complete."
 
 # ---------------------------------------------------------------------------

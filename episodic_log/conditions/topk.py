@@ -133,41 +133,9 @@ class TopKCondition(BaseCondition):
                         except (KeyError, ValueError):
                             pass
 
-        # ── Select top-k by keyword overlap with the question ────────────────
-        scored = sorted(
-            summaries,
-            key=lambda s: _keyword_overlap(question, s.summary),
-            reverse=True,
+        user_msg, preloaded_ids = self._build_prompt(
+            question, summaries, turn_map, summaries_dir,
         )
-        top_k = scored[: self._k]
-        preloaded_ids = [s.turn_id for s in top_k]
-
-        preloaded_blocks: list[str] = []
-        for s in top_k:
-            event = turn_map.get(s.turn_id)
-            if event is None:
-                continue
-            role_label = event.role.value.upper()
-            preloaded_blocks.append(
-                f"[{role_label} | turn {event.turn_id}]\n{event.content}"
-            )
-
-        # ── Build prompt ─────────────────────────────────────────────────────
-        summary_context = format_summaries_as_context(summaries_dir, self._summary_method)
-        sep = "\n" + "─" * 40 + "\n"
-
-        user_msg_parts = []
-        if summary_context:
-            user_msg_parts.append(
-                f"Memory index ({len(summaries)} turns):\n{summary_context}"
-            )
-        if preloaded_blocks:
-            user_msg_parts.append(
-                f"Pre-loaded turns (top {self._k} by keyword match):\n"
-                + sep.join(preloaded_blocks)
-            )
-        user_msg_parts.append(f"Question: {question}")
-        user_msg = "\n\n".join(user_msg_parts)
 
         predicted = provider.generate(
             messages=[{"role": "user", "content": user_msg}],
@@ -187,3 +155,119 @@ class TopKCondition(BaseCondition):
             tool_calls=[],
             turns_loaded=preloaded_ids,
         )
+
+    def _build_prompt(
+        self,
+        question: str,
+        summaries: list[TurnSummary],
+        turn_map: dict[str, TurnEvent],
+        summaries_dir: Path,
+    ) -> tuple[str, list[str]]:
+        """Build the user message and return (user_msg, preloaded_turn_ids)."""
+        scored = sorted(
+            summaries,
+            key=lambda s: _keyword_overlap(question, s.summary),
+            reverse=True,
+        )
+        top_k = scored[: self._k]
+        preloaded_ids = [s.turn_id for s in top_k]
+
+        sep = "\n" + "─" * 40 + "\n"
+        preloaded_blocks: list[str] = []
+        for s in top_k:
+            event = turn_map.get(s.turn_id)
+            if event is None:
+                continue
+            role_label = event.role.value.upper()
+            preloaded_blocks.append(
+                f"[{role_label} | turn {event.turn_id}]\n{event.content}"
+            )
+
+        summary_context = format_summaries_as_context(summaries_dir, self._summary_method)
+        parts: list[str] = []
+        if summary_context:
+            parts.append(f"Memory index ({len(summaries)} turns):\n{summary_context}")
+        if preloaded_blocks:
+            parts.append(
+                f"Pre-loaded turns (top {self._k} by keyword match):\n"
+                + sep.join(preloaded_blocks)
+            )
+        parts.append(f"Question: {question}")
+        return "\n\n".join(parts), preloaded_ids
+
+    def run_batch(
+        self,
+        sessions: list[dict],
+        provider: "BaseProvider",  # type: ignore[name-defined]
+    ) -> "list[ConditionResult]":  # type: ignore[name-defined]
+        """Run all sessions in one generate_batch call.
+
+        Loads summaries and turn maps for every session on CPU, builds all
+        prompts, then submits them to the provider in a single batch.
+
+        Args:
+            sessions: List of session metadata dicts.
+            provider: Initialised LLM provider with ``generate_batch``.
+
+        Returns:
+            Ordered list of :class:`ConditionResult`.
+        """
+        from episodic_log.conditions.base import ConditionResult  # noqa: PLC0415
+        from episodic_log.providers.base import BaseProvider  # noqa: PLC0415
+
+        all_msgs: list[list[dict]] = []
+        all_ids: list[list[str]] = []
+
+        for meta in sessions:
+            question: str = meta["question"]
+            summaries_dir = Path(meta["summaries_dir"])
+            log_path = Path(meta["log_path"])
+
+            summaries: list[TurnSummary] = []
+            summary_path = summaries_dir / f"{self._summary_method}.jsonl"
+            if summary_path.exists():
+                with summary_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        stripped = line.strip()
+                        if stripped:
+                            try:
+                                summaries.append(TurnSummary.from_json(stripped))
+                            except (KeyError, ValueError):
+                                pass
+
+            turn_map: dict[str, TurnEvent] = {}
+            if log_path.exists():
+                with log_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        stripped = line.strip()
+                        if stripped:
+                            try:
+                                ev = TurnEvent.from_json(stripped)
+                                turn_map[ev.turn_id] = ev
+                            except (KeyError, ValueError):
+                                pass
+
+            user_msg, preloaded_ids = self._build_prompt(
+                question, summaries, turn_map, summaries_dir
+            )
+            all_msgs.append([{"role": "user", "content": user_msg}])
+            all_ids.append(preloaded_ids)
+
+        answers = provider.generate_batch(
+            all_msgs, system=_SYSTEM_PROMPT, max_tokens=512, temperature=0.0
+        )
+
+        return [
+            ConditionResult(
+                session_id=s["session_id"],
+                question_id=s["question_id"],
+                question=s["question"],
+                ground_truth=s["answer"],
+                predicted_answer=a.strip(),
+                condition=self.name,
+                summary_method=self._summary_method,
+                tool_calls=[],
+                turns_loaded=ids,
+            )
+            for s, a, ids in zip(sessions, answers, all_ids)
+        ]
