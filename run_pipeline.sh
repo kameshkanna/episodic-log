@@ -91,78 +91,87 @@ fi
 log "Summarization complete."
 
 # ---------------------------------------------------------------------------
-# STEP 3: Evaluate — 8 conditions × 1 GPU each, all in parallel (~30 min)
-#         Qwen3-32B BF16 = ~64 GB, fits on 1× H100
+# STEP 3: Evaluate — 8 conditions in 2 waves of 4, each worker gets 2 GPUs
+#         Qwen3-32B BF16 on 2× H100 = tensor parallel 2, faster throughput
 # ---------------------------------------------------------------------------
-log "=== STEP 3: Evaluate (8 conditions × 1 GPU, $HF_MODEL) ==="
+log "=== STEP 3: Evaluate (2 waves × 4 conditions, 2 GPUs/worker, $HF_MODEL) ==="
 
 OVERWRITE_FLAG=""
 [[ -n "${FORCE_EVAL:-}" ]] && OVERWRITE_FLAG="--overwrite"
 
-CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
+# Wave 1: 4 conditions, GPUs 0-1 / 2-3 / 4-5 / 6-7
+log "--- Wave 1: amnesiac + recall/lexical + recall/scout + recall/echo ---"
+
+CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
     --condition amnesiac \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_amnesiac.log" &
 EVAL0_PID=$!
 
-CUDA_VISIBLE_DEVICES=1 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=2,3 python scripts/evaluate.py \
     --condition recall --summary-method lexical \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_recall_lexical.log" &
 EVAL1_PID=$!
 
-CUDA_VISIBLE_DEVICES=2 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=4,5 python scripts/evaluate.py \
     --condition recall --summary-method scout \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_recall_scout.log" &
 EVAL2_PID=$!
 
-CUDA_VISIBLE_DEVICES=3 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=6,7 python scripts/evaluate.py \
     --condition recall --summary-method echo \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_recall_echo.log" &
 EVAL3_PID=$!
 
-CUDA_VISIBLE_DEVICES=4 python scripts/evaluate.py \
+wait $EVAL0_PID || { log "ERROR: amnesiac eval failed";       exit 1; }
+wait $EVAL1_PID || { log "ERROR: recall/lexical eval failed"; exit 1; }
+wait $EVAL2_PID || { log "ERROR: recall/scout eval failed";   exit 1; }
+wait $EVAL3_PID || { log "ERROR: recall/echo eval failed";    exit 1; }
+log "Wave 1 complete."
+
+# Wave 2: grep_recall/lexical + grep_recall/scout + grep_recall/echo + topk/lexical/k5
+log "--- Wave 2: grep_recall × 3 + topk/lexical/k5 ---"
+
+CUDA_VISIBLE_DEVICES=0,1 python scripts/evaluate.py \
     --condition grep_recall --summary-method lexical \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_grep_recall_lexical.log" &
 EVAL4_PID=$!
 
-CUDA_VISIBLE_DEVICES=5 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=2,3 python scripts/evaluate.py \
     --condition grep_recall --summary-method scout \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_grep_recall_scout.log" &
 EVAL5_PID=$!
 
-CUDA_VISIBLE_DEVICES=6 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=4,5 python scripts/evaluate.py \
     --condition grep_recall --summary-method echo \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_grep_recall_echo.log" &
 EVAL6_PID=$!
 
-CUDA_VISIBLE_DEVICES=7 python scripts/evaluate.py \
+CUDA_VISIBLE_DEVICES=6,7 python scripts/evaluate.py \
     --condition topk --summary-method lexical --retrieval-k 5 \
     --provider "$HF_MODEL" \
-    --num-gpus 1 --gpus-per-worker 1 $OVERWRITE_FLAG \
+    --num-gpus 2 --gpus-per-worker 2 $OVERWRITE_FLAG \
     2>&1 | tee "$LOG_DIR/eval_topk_lexical_k5.log" &
 EVAL7_PID=$!
 
-wait $EVAL0_PID || { log "ERROR: amnesiac eval failed";        exit 1; }
-wait $EVAL1_PID || { log "ERROR: recall/lexical eval failed";  exit 1; }
-wait $EVAL2_PID || { log "ERROR: recall/scout eval failed";    exit 1; }
-wait $EVAL3_PID || { log "ERROR: recall/echo eval failed";     exit 1; }
-wait $EVAL4_PID || { log "ERROR: grep_recall/lexical failed";  exit 1; }
-wait $EVAL5_PID || { log "ERROR: grep_recall/scout failed";    exit 1; }
-wait $EVAL6_PID || { log "ERROR: grep_recall/echo failed";     exit 1; }
-wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 failed";      exit 1; }
+wait $EVAL4_PID || { log "ERROR: grep_recall/lexical failed"; exit 1; }
+wait $EVAL5_PID || { log "ERROR: grep_recall/scout failed";   exit 1; }
+wait $EVAL6_PID || { log "ERROR: grep_recall/echo failed";    exit 1; }
+wait $EVAL7_PID || { log "ERROR: topk/lexical/k5 failed";     exit 1; }
+log "Wave 2 complete."
 log "Evaluation complete."
 
 # ---------------------------------------------------------------------------

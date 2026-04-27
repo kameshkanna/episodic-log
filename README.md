@@ -141,14 +141,14 @@ Step 1  ingest.py           CPU       ~5 min   500 sessions → log.jsonl files
 Step 2a summarize.py        CPU       ~2 min   lexical summaries (no model)
 Step 2b summarize.py        vLLM tp4  ~5 min   scout + echo in parallel
                             GPUs 0-3 / 4-7
-Step 3  evaluate.py         HF BF16   ~30 min  8 conditions × 1 GPU each
-                            Qwen3-32B, 1× H100 per worker (fits in 64 GB)
+Step 3  evaluate.py         HF BF16   ~30 min  8 conditions in 2 waves × 4
+                            Qwen3-32B tp2, 2× H100 per worker
 Step 4  judge.py            vLLM tp8  ~5 min   all verdicts in one generate() call
 Step 5  score.py            CPU       <1 min   print results table
 ```
 
-The main pipeline runs: amnesiac + recall/lexical + recall/scout + recall/echo.
-Run grep_recall and topk separately as ablations (see below).
+Wave 1 runs in parallel: amnesiac + recall/lexical + recall/scout + recall/echo.
+Wave 2 runs in parallel: grep_recall × 3 + topk/lexical/k5.
 
 ---
 
