@@ -22,9 +22,7 @@ env/
 *.env.local
 
 # Data directories (large files, not tracked)
-data/sessions/
-data/results/
-data/submissions/
+data/
 
 # Jupyter
 .ipynb_checkpoints/
