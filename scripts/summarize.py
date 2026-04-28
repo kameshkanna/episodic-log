@@ -407,15 +407,18 @@ def _run_vllm_sessions(
         return
 
     total_events = sum(len(evs) for _, evs in all_session_data)
+    # Cap at 2048: submitting 200k+ prompts in one LLM.generate() call causes
+    # vLLM EngineCore to die during prompt rendering. 2048 keeps CPU memory
+    # manageable while still filling the GPU with a large continuous batch.
+    _VLLM_CHUNK = 2048
     logger.info(
-        "vLLM mega-batch: %d sessions, %d total events → single LLM.generate() call",
-        len(all_session_data), total_events,
+        "vLLM batch: %d sessions, %d total events → chunks of %d",
+        len(all_session_data), total_events, _VLLM_CHUNK,
     )
 
-    # Phase 2: flatten all events and generate all summaries in one shot.
+    # Phase 2: flatten all events and generate all summaries in chunks.
     all_events_flat = [e for _, evs in all_session_data for e in evs]
-    # Pass batch_size=total_events so vLLM receives all prompts at once.
-    all_summaries = summarizer.summarize_batch(all_events_flat, batch_size=total_events)
+    all_summaries = summarizer.summarize_batch(all_events_flat, batch_size=_VLLM_CHUNK)
 
     # Phase 3: write summaries back per session.
     n_written = 0
