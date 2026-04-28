@@ -1,20 +1,23 @@
 """Keyword grep tool for the CHD evaluation agent.
 
-The model generates its own search keywords based on the question, then calls
-this tool to find matching summary lines.  Matching is simple case-insensitive
-substring search — no scoring, no ranking.  Every summary line that contains
-any of the query words is returned.
+The model generates its own search keywords, calls this tool, and immediately
+receives the top-3 matching turns WITH their full verbatim content pre-loaded.
+No follow-up load_turn call is needed for those turns — the model can answer
+directly from the returned content.  Additional matches (beyond top-3) are
+listed as summary-only; the model may call load_turn on them if needed.
 
-This is intentionally different from BM25:
-  - BM25 scores every document using TF-IDF weighting and the raw question.
-  - This tool returns all lines matching model-chosen keywords (binary match).
-  - The model decides WHAT to search for; the system just does the grep.
+Ranking: matches are scored by how many unique query keywords appear in their
+summary (higher = more relevant), so the most relevant turns bubble up first.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from episodic_log.core.turn_event import TurnEvent
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +31,10 @@ GREP_MEMORY_SCHEMA: dict = {
         "name": "grep_memory",
         "description": (
             "Search the memory index for turns matching your keywords. "
-            "Returns all summary lines that contain any of the keywords. "
-            "Choose specific keywords that would appear in a summary of the relevant turn. "
-            "Call load_turn with a turn_id to read the full content."
+            "Returns the top-3 matching turns with their FULL verbatim content "
+            "already loaded — you can answer directly from them without calling "
+            "load_turn. Additional matches are listed as summaries; call "
+            "load_turn(turn_id) on those if you need their full content."
         ),
         "parameters": {
             "type": "object",
@@ -45,8 +49,8 @@ GREP_MEMORY_SCHEMA: dict = {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of matching lines to return (default 20).",
-                    "default": 20,
+                    "description": "Maximum number of matching turns to list (default 10).",
+                    "default": 10,
                 },
             },
             "required": ["keywords"],
@@ -54,8 +58,10 @@ GREP_MEMORY_SCHEMA: dict = {
     },
 }
 
-_MIN_KEYWORD_LEN = 3  # ignore very short words like "a", "is", "to"
+_MIN_KEYWORD_LEN = 3
 _WORD_RE = re.compile(r"\b\w+\b")
+_INLINE_TOP_K = 3  # always inline content for the top-3 matches
+_SEP = "\n" + "─" * 60 + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -66,19 +72,21 @@ _WORD_RE = re.compile(r"\b\w+\b")
 def grep_memory(
     keywords: str,
     summaries_text: str,
-    max_results: int = 20,
+    turn_map: "dict[str, TurnEvent]",
+    max_results: int = 10,
 ) -> str:
-    """Return all summary lines containing any of the given keywords.
+    """Return top-3 matching turns with full content, plus remaining summary hits.
 
     Args:
         keywords: Space-separated search terms chosen by the model.
-        summaries_text: The full pre-formatted summary block, one line per turn
-            in the format ``[turn_id] summary text``.
-        max_results: Maximum lines to return.
+        summaries_text: Full pre-formatted TSV summary block (turn_id<TAB>summary).
+        turn_map: Mapping from turn_id to :class:`~episodic_log.core.turn_event.TurnEvent`.
+        max_results: Maximum total matches to include (default 10).
 
     Returns:
-        A formatted string listing matching summary lines, or a "no match"
-        message with a suggestion to try different keywords.
+        Formatted string — top-3 matches with verbatim content, remaining as
+        summary-only lines.  Returns a no-match message with suggestions if
+        no turns matched.
 
     Raises:
         TypeError: If *keywords* is not a string.
@@ -92,7 +100,6 @@ def grep_memory(
     if not summaries_text:
         return "No memory index available for this session."
 
-    # Extract meaningful keywords (skip very short stop-words).
     kws = [
         w.lower()
         for w in _WORD_RE.findall(keywords)
@@ -104,36 +111,75 @@ def grep_memory(
             "Use specific nouns or action words."
         )
 
-    # summaries_text is TSV: first line is the header "turn_id\tsummary".
-    # Skip the header and search only the summary column (after the tab) so
-    # keywords like "turn" or "summary" don't spuriously match the header row,
-    # and numeric queries don't accidentally match turn IDs.
     all_lines = summaries_text.splitlines()
     data_lines = [ln for ln in all_lines if "\t" in ln and not ln.startswith("turn_id\t")]
-    matches = [
-        ln for ln in data_lines
-        if any(kw in ln.split("\t", 1)[1].lower() for kw in kws)
-    ]
 
-    if not matches:
+    # Score each line by number of unique keywords matched in the summary column.
+    scored: list[tuple[int, str]] = []
+    for ln in data_lines:
+        summary_col = ln.split("\t", 1)[1].lower()
+        score = sum(1 for kw in kws if kw in summary_col)
+        if score > 0:
+            scored.append((score, ln))
+
+    if not scored:
         return (
             f"No turns matched keywords {kws}. "
             "Try synonyms, a shorter keyword, or a different aspect of the question."
         )
 
-    results = matches[:max_results]
-    truncation_note = (
-        f"\n(showing {max_results} of {len(matches)} matches — "
-        "refine keywords to narrow results)"
-        if len(matches) > max_results else ""
-    )
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = scored[:max_results]
+    total_matched = len(scored)
 
     logger.debug(
-        "grep_memory: keywords=%r matched %d/%d data lines.", keywords, len(matches), len(data_lines)
+        "grep_memory: keywords=%r matched %d/%d turns (showing %d).",
+        keywords, total_matched, len(data_lines), len(results),
     )
-    return (
-        f"grep_memory: {len(results)} matching turn(s) for '{keywords}':\n\n"
-        + "\n".join(results)
-        + truncation_note
-        + "\n\nCall load_turn(turn_id) to read the full content of any turn."
+
+    header = (
+        f"grep_memory: {total_matched} matching turn(s) for '{keywords}'"
+        + (f" (showing top {max_results})" if total_matched > max_results else "")
+        + "\n"
     )
+
+    inline_parts: list[str] = []
+    summary_parts: list[str] = []
+
+    for i, (score, ln) in enumerate(results):
+        turn_id = ln.split("\t", 1)[0]
+        summary_text = ln.split("\t", 1)[1] if "\t" in ln else ln
+
+        if i < _INLINE_TOP_K:
+            event = turn_map.get(turn_id)
+            if event is not None:
+                role_label = event.role.value.upper()
+                inline_parts.append(
+                    f"[{role_label} | turn {turn_id}]  score={score}\n"
+                    f"Summary: {summary_text}\n"
+                    f"Full content:\n{event.content}"
+                )
+            else:
+                inline_parts.append(
+                    f"[turn {turn_id}]  score={score}\n"
+                    f"Summary: {summary_text}\n"
+                    "(full content unavailable)"
+                )
+        else:
+            summary_parts.append(f"  {turn_id}\t{summary_text}  [score={score}]")
+
+    sections: list[str] = []
+
+    if inline_parts:
+        sections.append(
+            f"── TOP {min(_INLINE_TOP_K, len(inline_parts))} TURNS (content pre-loaded — answer directly from these) ──\n"
+            + _SEP.join(inline_parts)
+        )
+
+    if summary_parts:
+        sections.append(
+            "── ADDITIONAL MATCHES (call load_turn to read full content) ──\n"
+            + "\n".join(summary_parts)
+        )
+
+    return header + "\n\n".join(sections)

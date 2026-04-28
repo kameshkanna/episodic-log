@@ -165,8 +165,9 @@ def make_session_tools(
         return {"load_turn": load_turn_fn}, TOOL_SCHEMAS
 
     # grep_and_load: pre-load the formatted summary block once, bind to grep_memory.
+    # Pass turn_map so grep can inline full content for the top-3 matches.
     summaries_text = format_summaries_as_context(summaries_dir, method)
-    grep_memory_fn = partial(grep_memory, summaries_text=summaries_text)
+    grep_memory_fn = partial(grep_memory, summaries_text=summaries_text, turn_map=turn_map)
 
     return (
         {"grep_memory": grep_memory_fn, "load_turn": load_turn_fn},

@@ -42,14 +42,18 @@ _SYSTEM_PROMPT_LOAD_ONLY: str = (
 
 _SYSTEM_PROMPT_GREP: str = (
     "You are answering a question about a past conversation.\n"
-    "You have two tools: grep_memory to search turn summaries, and load_turn to read full turns.\n\n"
+    "You have two tools: grep_memory and load_turn.\n\n"
+    "How grep_memory works:\n"
+    "  - Returns the TOP 3 matching turns with their FULL verbatim content already included.\n"
+    "  - You can answer DIRECTLY from those 3 turns — no load_turn needed for them.\n"
+    "  - Additional lower-ranked matches are listed as summaries only.\n\n"
     "Instructions:\n"
-    "1. Think about what keywords would appear in a summary of the relevant turn.\n"
-    "2. Call grep_memory with those keywords to find candidate turns.\n"
-    "3. If the first search misses, try different keywords or synonyms.\n"
-    "4. Call load_turn on turns that look relevant from their summary.\n"
-    "5. Answer ONLY after reading the verbatim turn content.\n"
-    "6. Do NOT guess — if you cannot find the answer after searching, say so."
+    "1. Think about what keywords would appear in the relevant turn.\n"
+    "2. Call grep_memory with those keywords.\n"
+    "3. Read the pre-loaded top-3 turn contents and answer if the answer is there.\n"
+    "4. If not found, try different keywords OR call load_turn on other listed turns.\n"
+    "5. Answer ONLY from verbatim turn content — do NOT guess.\n"
+    "6. If you cannot find the answer after searching, say so explicitly."
 )
 
 
