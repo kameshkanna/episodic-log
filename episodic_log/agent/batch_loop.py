@@ -18,6 +18,7 @@ Falls back gracefully to the regular AgentLoop for providers that don't.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,12 @@ from episodic_log.agent.trace import AgentTrace, ToolCallRecord
 from episodic_log.tools.session_tools import format_summaries_as_context, make_session_tools
 
 logger = logging.getLogger(__name__)
+
+# Matches inline turn headers emitted by grep_memory for its top-k results.
+_GREP_INLINE_TURN_RE = re.compile(
+    r"\[(?:USER|ASSISTANT|TOOL|SYSTEM)\s*\|\s*turn\s+(\w+)\]",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -179,7 +186,10 @@ def run_batch(
                 timestamp=datetime.now(tz=timezone.utc),
             ))
             if tool_name == "load_turn" and "turn_id" in tool_args:
-                state.turns_loaded.append(str(tool_args["turn_id"]))
+                state.turns_loaded.append(str(tool_args["turn_id"]).strip())
+            elif tool_name == "grep_memory":
+                # grep inlines top-3 turns verbatim — track their IDs too.
+                state.turns_loaded.extend(_GREP_INLINE_TURN_RE.findall(tool_result))
 
             state.messages.append({"role": "tool", "content": tool_result, "name": tool_name})
             state.step += 1

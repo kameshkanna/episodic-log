@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,13 @@ from episodic_log.providers.base import BaseProvider
 from episodic_log.tools.session_tools import format_summaries_as_context, make_session_tools
 
 logger = logging.getLogger(__name__)
+
+# Matches inline turn headers emitted by grep_memory for its top-k results:
+#   "[USER | turn 0042]" / "[ASSISTANT | turn 0007]" etc.
+_GREP_INLINE_TURN_RE = re.compile(
+    r"\[(?:USER|ASSISTANT|TOOL|SYSTEM)\s*\|\s*turn\s+(\w+)\]",
+    re.IGNORECASE,
+)
 
 # Hard cap on the summary block injected into the first user message.
 # TSV format (turn_id\tone-line-summary) collapses multi-line content and keeps
@@ -265,7 +273,10 @@ class AgentLoop:
             )
 
             if tool_name == "load_turn" and "turn_id" in tool_args:
-                turns_loaded.append(str(tool_args["turn_id"]))
+                turns_loaded.append(str(tool_args["turn_id"]).strip())
+            elif tool_name == "grep_memory":
+                # grep inlines top-3 turns verbatim — track their IDs too.
+                turns_loaded.extend(_GREP_INLINE_TURN_RE.findall(tool_result))
 
             messages.append(
                 {"role": "tool", "content": tool_result, "name": tool_name}
