@@ -38,10 +38,10 @@ GREP_TOOL_SCHEMAS: list[dict] = [GREP_MEMORY_SCHEMA, LOAD_TURN_SCHEMA]
 
 
 # Per-summary char cap so all 500 turns always fit in the index.
-# 500 turns × (5 id + 1 tab + 150 summary + 1 newline) ≈ 78 k chars — well under
-# the 100 k global cap.  Long echo summaries are clipped with "…" rather than
-# dropping the whole turn, so the model still sees every turn ID.
-_MAX_SUMMARY_LINE_CHARS: int = 150
+# 500 turns × (4 id + 1 tab + 120 summary + 1 newline) ≈ 63 k chars ≈ 25 k tokens —
+# safely under the 49 152-token vLLM context window even for dense echo summaries.
+# Long summaries are clipped with "…" so every turn ID remains visible.
+_MAX_SUMMARY_LINE_CHARS: int = 120
 
 
 def format_summaries_as_context(summaries_dir: Path, method: str) -> str:

@@ -29,12 +29,11 @@ _GREP_INLINE_TURN_RE = re.compile(
 )
 
 # Hard cap on the summary block injected into the first user message.
-# TSV format (turn_id\tone-line-summary) collapses multi-line content and keeps
-# each row compact.  500 turns × ~150 chars/row ≈ 75k chars typical; 500 × 512
-# chars/row (max 128 tokens) ≈ 256k worst case.  100k covers the typical case
-# and leaves the token budget for tool results and the model's own output.
-# Qwen3-32B context window is 128k tokens; 100k chars ≈ 25k tokens for the index.
-_MAX_SUMMARY_CHARS: int = 100_000
+# With _MAX_SUMMARY_LINE_CHARS=120 in session_tools.py, a 500-turn index is
+# at most 63k chars (≈25k tokens).  This cap (75k) is a safety net for sessions
+# with unusually long turn IDs or edge-case formatting; it is never reached
+# in practice but truncates gracefully at a line boundary if hit.
+_MAX_SUMMARY_CHARS: int = 75_000
 
 _SYSTEM_PROMPT_LOAD_ONLY: str = (
     "You are answering a question about a past conversation.\n"
