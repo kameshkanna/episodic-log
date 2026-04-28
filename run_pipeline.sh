@@ -111,8 +111,11 @@ _eval() {
     python scripts/evaluate.py "$@" \
         --provider "$EVAL_MODEL" --num-gpus 8 --gpus-per-worker 8 $OVERWRITE_FLAG \
         2>&1 | tee "$LOG_DIR/eval_${label}.log"
-    local rc=$?
-    [[ $rc -ne 0 ]] && { log "ERROR: $label failed (exit $rc)"; exit $rc; }
+    local rc=${PIPESTATUS[0]}
+    if [[ $rc -ne 0 ]]; then
+        log "ERROR: $label failed (exit $rc)"
+        exit $rc
+    fi
 }
 
 _eval "amnesiac"          --condition amnesiac
