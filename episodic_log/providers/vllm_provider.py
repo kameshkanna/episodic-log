@@ -45,7 +45,7 @@ class VLLMProvider(BaseProvider):
         self,
         model_name: str,
         tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.82,
+        gpu_memory_utilization: float = 0.87,
         max_model_len: int = 32_768,
         max_num_batched_tokens: int = 65_536,
     ) -> None:

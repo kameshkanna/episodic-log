@@ -329,6 +329,7 @@ def _run_worker(
                 summary_method=summary_method,
                 mode=_mode,
                 provider=provider,
+                max_tool_calls=getattr(cond, "_max_tool_calls", 8),
             )
         except Exception as exc:
             worker_logger.error(
