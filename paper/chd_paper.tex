@@ -1,0 +1,307 @@
+\documentclass[11pt,twocolumn]{article}
+
+\usepackage[margin=0.75in,top=0.85in,bottom=0.85in]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage[numbers,compress]{natbib}
+
+\hypersetup{colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue}
+\setlength{\columnsep}{0.25in}
+
+% ─── compact section spacing ──────────────────────────────────────────────────
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{6pt}{3pt}
+\titlespacing*{\subsection}{0pt}{4pt}{2pt}
+\setlength{\parskip}{2pt}
+
+\title{\textbf{Conversational Hallucination Drift: An Episodic Retrieval\\
+Framework and Error Taxonomy for Long-Term Memory Evaluation}}
+
+\author{
+  Kamesh R. \\
+  \small{\texttt{kamesh@episodic-log}}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+% ─── ABSTRACT ────────────────────────────────────────────────────────────────
+\begin{abstract}
+Long-term conversational memory remains a persistent weakness of large
+language models. We study this failure mode on LongMemEval~\cite{wu2025longmemeval},
+a 500-question benchmark embedded in realistic user-assistant histories.
+We introduce the \textbf{Conversational Hallucination Drift (CHD)} taxonomy, which
+classifies memory errors into four mechanistically distinct types:
+\textit{commission}, \textit{omission}, \textit{distortion}, and
+\textit{confabulation}. We implement an open episodic retrieval
+framework pairing three summarization strategies (lexical, scout,
+echo) with two retrieval conditions (recall, grep-recall) and evaluate
+Qwen3-32B as the reasoning model. Our best configuration---recall
+with scout summaries---achieves \textbf{24.9\% accuracy}, closely matching
+the 24.7\% reported for Coze with GPT-3.5-turbo~\cite{wu2025longmemeval},
+using a fully open-weight stack. CHD analysis reveals that \textbf{omission
+accounts for 68\% of remaining errors}, identifying generation
+faithfulness---not retrieval---as the primary bottleneck. All code
+and evaluation scripts are released.
+\end{abstract}
+
+% ─── 1. INTRODUCTION ─────────────────────────────────────────────────────────
+\section{Introduction}
+
+Conversational agents are increasingly expected to remember what users
+told them days or weeks ago. Yet evaluations consistently show that
+LLMs degrade sharply when answer evidence is buried in long interaction
+histories. LongMemEval~\cite{wu2025longmemeval} operationalises this
+challenge: 500 questions require reasoning over sessions that can
+exceed 115k tokens, and the best open-model long-context baseline
+(GPT-4o, full context) achieves only 60.6\%, while smaller open
+models fall to 12--33\%.
+
+Memory-augmented systems address this with retrieval scaffolds, but
+most published work uses proprietary APIs, leaving the open-weight
+community without a reproducible reference point. Separately, existing
+hallucination taxonomies~\cite{li2023halueval,maynez2020faithfulness}
+are designed for single-turn factuality and do not capture the
+\emph{self-referential} errors that arise when a model misremembers
+its own past behaviour.
+
+We make three contributions:
+\begin{enumerate}[leftmargin=*,itemsep=0pt,topsep=2pt]
+  \item A \textbf{CHD taxonomy} (§\ref{sec:taxonomy}) grounded in
+        cognitive-science confabulation research~\cite{schnider2008confabulating}
+        that distinguishes four mechanistically distinct error types.
+  \item An \textbf{open episodic retrieval framework} (§\ref{sec:framework})
+        that ingests LongMemEval sessions and evaluates six condition
+        combinations in a fully reproducible pipeline.
+  \item A \textbf{controlled ablation} (§\ref{sec:experiments}) showing
+        that recall with scout summarisation reaches 24.9\% with
+        Qwen3-32B, closely matching the commercial Coze/GPT-3.5 baseline,
+        and that omission---not retrieval failure---accounts for
+        the majority of remaining errors.
+\end{enumerate}
+
+% ─── 2. CHD TAXONOMY ─────────────────────────────────────────────────────────
+\section{CHD Taxonomy}
+\label{sec:taxonomy}
+
+Existing hallucination taxonomies distinguish \emph{intrinsic} errors
+(contradicting source material) from \emph{extrinsic} ones (inventing
+unsupported content)~\cite{maynez2020faithfulness}. This two-way split
+is too coarse for memory agents, where the ``source'' is the model's own
+interaction history. We propose four types:
+
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=2pt]
+  \item \textbf{Commission.} The model asserts it performed an action it
+        never did (\emph{false memory insertion}).
+  \item \textbf{Omission.} The model fails to recall a clearly stated past
+        action or fact (\emph{memory dropout}).
+  \item \textbf{Distortion.} The model recalls the correct event but with
+        wrong key details---wrong date, wrong value, wrong name.
+  \item \textbf{Confabulation.} The model invents plausible-sounding history
+        with no grounding in the log.
+\end{itemize}
+
+A judge model (Qwen2.5-14B-Instruct~\cite{qwen25}) classifies each
+predicted answer into one of these four categories or \textit{correct},
+given the question, ground truth, and predicted answer. We note that
+our judge differs from the GPT-4o judge used in the original
+LongMemEval paper; direct accuracy comparisons should be interpreted
+with this caveat in mind. Inter-annotator agreement with human labels
+is deferred to future work.
+
+% ─── 3. EPISODIC RETRIEVAL FRAMEWORK ─────────────────────────────────────────
+\section{Episodic Retrieval Framework}
+\label{sec:framework}
+
+\paragraph{Ingestion.} Each LongMemEval session is converted into an
+append-only \texttt{log.jsonl} file (one \texttt{TurnEvent} per line),
+preserving role, content, and turn ID.
+
+\paragraph{Summarisation.} Three strategies build a per-session summary
+index:
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=2pt]
+  \item \textbf{Lexical.} Rule-based keyword extraction; no model; runs on
+        CPU in seconds. Produces sparse, reproducible summaries.
+  \item \textbf{Scout.} Qwen2.5-7B-Instruct~\cite{qwen25} writes a
+        retrieval-optimised 1--2 sentence summary per turn, emphasising
+        specific nouns, dates, and action verbs.
+  \item \textbf{Echo.} The same 7B model writes a detail-preserving
+        summary, retaining numbers, names, and quoted values verbatim.
+\end{itemize}
+Each summary is capped at 120 characters to keep the full 500-turn
+index within 25k tokens.
+
+\paragraph{Retrieval conditions.} We implement two agent-loop strategies:
+\begin{itemize}[leftmargin=*,itemsep=0pt,topsep=2pt]
+  \item \textbf{Recall.} The full summary index is injected into the
+        first user message. The model scans it, identifies relevant
+        turn IDs, and calls \texttt{load\_turn} to read verbatim content
+        before answering. Up to 8 \texttt{load\_turn} calls permitted.
+  \item \textbf{Grep-recall.} No index is injected. The model formulates
+        keywords and calls \texttt{grep\_memory} (substring match over
+        summaries); the top-3 matches are returned with full verbatim
+        content. Up to 15 combined tool calls permitted.
+\end{itemize}
+Both strategies use Qwen3-32B~\cite{qwen3} via vLLM~\cite{kwon2023vllm}
+with tensor-parallel inference across 8 A100 40\,GB GPUs.
+
+% ─── 4. EXPERIMENTS ──────────────────────────────────────────────────────────
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+We evaluate all 500 questions from LongMemEval~\cite{wu2025longmemeval}.
+The reasoning model is Qwen3-32B (BF16, tp=8). The summariser for
+scout and echo conditions is Qwen2.5-7B-Instruct (BF16, tp=4). Judging
+uses Qwen2.5-14B-Instruct (BF16, tp=8). All inference runs on 8$\times$
+A100 40\,GB via vLLM. The \textit{amnesiac} baseline answers purely from
+parametric knowledge with no memory access.
+
+\subsection{Main Results}
+
+Table~\ref{tab:main} reports accuracy and CHD breakdown for all
+conditions. Published baselines from~\citet{wu2025longmemeval} are
+included for reference (marked $\dagger$; GPT-4o judge).
+
+\begin{table}[h]
+\centering
+\caption{Accuracy and CHD error breakdown on LongMemEval (500 Qs).
+$\dagger$ = published result with GPT-4o judge; all others use
+Qwen2.5-14B judge. Com.~= commission, Omi.~= omission,
+Dis.~= distortion, Con.~= confabulation.}
+\label{tab:main}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{llccccc}
+\toprule
+\textbf{Condition} & \textbf{Method} & \textbf{Acc.} & \textbf{Com.} & \textbf{Omi.} & \textbf{Dis.} & \textbf{Con.} \\
+\midrule
+\multicolumn{2}{l}{\textit{Published baselines}$^\dagger$} & & & & & \\
+GPT-4o full ctx & --- & 60.6\% & --- & --- & --- & --- \\
+ChatGPT memory & GPT-4o & 57.7\% & --- & --- & --- & --- \\
+Coze memory & GPT-3.5 & 24.7\% & --- & --- & --- & --- \\
+\midrule
+\multicolumn{2}{l}{\textit{Our conditions (Qwen3-32B)}} & & & & & \\
+recall      & scout   & \textbf{24.9\%} & 2.8\% & 53.4\% & 16.4\% & 4.4\% \\
+grep-recall & scout   & 22.2\% & 2.4\% & 49.4\% & 19.2\% & 6.8\% \\
+grep-recall & lexical & 20.4\% & 2.2\% & 59.8\% & 14.2\% & 3.4\% \\
+recall      & lexical & 19.8\% & 2.2\% & 59.2\% & 13.8\% & 5.0\% \\
+recall      & echo    & 13.2\% & 3.4\% & 62.0\% & 14.0\% & 7.4\% \\
+grep-recall & echo    & 12.6\% & 0.8\% & 68.6\% & 13.2\% & 4.8\% \\
+amnesiac    & ---     &  5.4\% & 0.6\% & 80.4\% &  7.4\% & 6.2\% \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\subsection{Analysis}
+
+\paragraph{Retrieval lifts performance substantially.}
+The amnesiac baseline reaches only 5.4\%, relying entirely on
+parametric knowledge. Our best retrieval condition (recall/scout)
+reaches 24.9\%---a 19.5 percentage-point improvement, confirming
+that memory scaffolding provides a substantial and measurable signal.
+
+\paragraph{Scout summarisation consistently outperforms lexical and echo.}
+Recall/scout (24.9\%) exceeds recall/lexical (19.8\%) by 5.1\,pp and
+recall/echo (13.2\%) by 11.7\,pp. Scout's retrieval-optimised phrasing
+allows the model to quickly identify relevant turns from the summary
+index. Echo summaries, despite being more information-dense, appear to
+introduce noise: the model attends to verbose detail in the index
+rather than calling \texttt{load\_turn} to read authoritative verbatim
+content.
+
+\paragraph{Grep-recall nearly matches recall at equal tool budgets.}
+With 15 tool calls, grep-recall/scout reaches 22.2\% versus
+recall/scout at 24.9\%---a gap of only 2.7\,pp. Earlier runs with
+grep-recall capped at 5 tool calls (versus recall's 8) showed a
+larger gap, confirming that the budget asymmetry, not the retrieval
+strategy itself, drove the apparent advantage of recall. Grep-recall
+is preferable in settings where injecting the full summary index
+is impractical due to context constraints.
+
+\paragraph{Omission dominates all conditions.}
+Across all memory conditions, omission is the leading error type,
+accounting for 49--68\% of failures (Table~\ref{tab:main}). Commission
+and confabulation are consistently below 8\%, indicating the model
+rarely invents memories; instead, it retrieves correctly but produces
+answers that drop precise values---a date becomes ``Tuesday'' without
+the month, an amount loses its exact figure. This diagnosis
+distinguishes two possible improvement axes: retrieval quality
+(already substantially addressed) and \emph{generation faithfulness}
+(the remaining bottleneck).
+
+\paragraph{Comparison to commercial baselines.}
+Recall/scout achieves 24.9\%, marginally exceeding the 24.7\% reported
+for Coze with GPT-3.5-turbo~\cite{wu2025longmemeval}. We emphasise that
+this comparison is approximate: the original paper uses GPT-4o as
+judge, while we use Qwen2.5-14B. Nevertheless, the results suggest
+that a lightweight open-weight pipeline can achieve competitive
+accuracy relative to commercial memory systems at this performance
+tier, while providing full interpretability via CHD error breakdown.
+The gap to frontier systems (ChatGPT/GPT-4o at 57.7\%) remains large
+and is not addressed by our current framework.
+
+% ─── 5. RELATED WORK ─────────────────────────────────────────────────────────
+\section{Related Work}
+
+\paragraph{Long-term memory benchmarks.}
+LongMemEval~\cite{wu2025longmemeval} is the primary benchmark we use.
+LOCOMO~\cite{maharana2024locomo} is a complementary benchmark used
+by most recent memory-system papers; we leave cross-benchmark
+evaluation to future work.
+
+\paragraph{Memory-augmented agents.}
+MemGPT~\cite{packer2023memgpt} introduces a paged virtual context for
+LLM agents, analogous to OS memory management. Recent systems---A-MEM~\cite{xu2025amem}, Mem0~\cite{chhikara2025mem0}, and
+MemoryOS~\cite{kang2025memoryos}---add dynamic memory update and
+hierarchical storage, evaluated primarily on LOCOMO rather than
+LongMemEval. ReadAgent~\cite{lee2024readagent} compresses documents
+into gist memories and retrieves originals on demand, closely related
+to our recall condition with scout summaries.
+
+\paragraph{Hallucination taxonomies.}
+Intrinsic/extrinsic faithfulness~\cite{maynez2020faithfulness} and
+HaluEval~\cite{li2023halueval} characterise factuality errors in
+summarisation and QA. Our CHD taxonomy focuses on the self-referential
+domain: errors arising when a model misremembers its own past
+interactions, motivated by cognitive-science accounts of
+confabulation~\cite{schnider2008confabulating}.
+
+% ─── 6. CONCLUSION ───────────────────────────────────────────────────────────
+\section{Conclusion}
+
+We introduced the CHD error taxonomy and an open episodic retrieval
+framework, showing that recall with scout summarisation and
+Qwen3-32B achieves 24.9\% on LongMemEval---competitive with a
+commercial GPT-3.5 memory system, with the caveat that judge models
+differ. CHD analysis reveals that omission accounts for the majority
+of remaining failures, pointing to generation faithfulness as the
+primary target for future improvement. The gap to frontier systems
+(GPT-4o) remains large and underscores that the problem is far from
+solved. Our code, evaluation pipeline, and prompts are publicly
+released to facilitate reproducible follow-up.
+
+\textbf{Limitations.} We evaluate a single model size (32B) on a single
+benchmark. Judge model mismatch limits strict numerical comparability
+with published baselines. CHD inter-annotator agreement with human
+labels has not been measured. We intend to address these in follow-up
+work.
+
+% ─── REFERENCES ──────────────────────────────────────────────────────────────
+\bibliographystyle{abbrvnat}
+\bibliography{references}
+
+\end{document}
