@@ -6,9 +6,9 @@ Supported condition names
 - ``"recall/lexical"``         — summary index + agent load_turn (lexical summaries).
 - ``"recall/scout"``           — summary index + agent load_turn (scout summaries).
 - ``"recall/echo"``            — summary index + agent load_turn (echo summaries).
-- ``"grep_recall/lexical"``    — grep_memory (top-3 auto-loaded) + load_turn (lexical).
-- ``"grep_recall/scout"``      — grep_memory (top-3 auto-loaded) + load_turn (scout).
-- ``"grep_recall/echo"``       — grep_memory (top-3 auto-loaded) + load_turn (echo).
+- ``"grep_recall/lexical"``    — grep_memory + load_turn (lexical), max 8 tool calls.
+- ``"grep_recall/scout"``      — grep_memory + load_turn (scout), max 8 tool calls.
+- ``"grep_recall/echo"``       — grep_memory + load_turn (echo), max 8 tool calls.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ _SUMMARY_METHODS = ("lexical", "scout", "echo")
 ALL_CONDITIONS: dict[str, BaseCondition] = {
     "amnesiac": AmnesiacCondition(),
     **{f"recall/{m}": RecallCondition(m, max_tool_calls=8) for m in _SUMMARY_METHODS},
-    **{f"grep_recall/{m}": GrepRecallCondition(m, max_tool_calls=5) for m in _SUMMARY_METHODS},
+    **{f"grep_recall/{m}": GrepRecallCondition(m, max_tool_calls=8) for m in _SUMMARY_METHODS},
 }
 
 
