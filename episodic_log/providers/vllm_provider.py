@@ -47,6 +47,7 @@ class VLLMProvider(BaseProvider):
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.92,
         max_model_len: int = 32_768,
+        max_num_batched_tokens: int = 32_768,
     ) -> None:
         try:
             from vllm import LLM, SamplingParams  # type: ignore[import]
@@ -67,8 +68,10 @@ class VLLMProvider(BaseProvider):
         self._model_name = model_name
         self._tp = tensor_parallel_size
         logger.info(
-            "VLLMProvider: loading model=%s tp=%d gpu_mem_util=%.2f max_model_len=%d",
-            model_name, tensor_parallel_size, gpu_memory_utilization, max_model_len,
+            "VLLMProvider: loading model=%s tp=%d gpu_mem_util=%.2f "
+            "max_model_len=%d max_num_batched_tokens=%d",
+            model_name, tensor_parallel_size, gpu_memory_utilization,
+            max_model_len, max_num_batched_tokens,
         )
 
         hf_token: str | None = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -80,6 +83,7 @@ class VLLMProvider(BaseProvider):
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
             dtype="bfloat16",
             trust_remote_code=True,
         )

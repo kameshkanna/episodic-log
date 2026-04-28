@@ -33,7 +33,7 @@ _SUMMARY_METHODS = ("lexical", "scout", "echo")
 ALL_CONDITIONS: dict[str, BaseCondition] = {
     "amnesiac": AmnesiacCondition(),
     **{f"recall/{m}": RecallCondition(m) for m in _SUMMARY_METHODS},
-    **{f"grep_recall/{m}": GrepRecallCondition(m) for m in _SUMMARY_METHODS},
+    **{f"grep_recall/{m}": GrepRecallCondition(m, max_tool_calls=5) for m in _SUMMARY_METHODS},
 }
 
 
