@@ -64,7 +64,7 @@ def get_provider(spec: str, **kwargs) -> BaseProvider:
                 tp = n
                 raw = raw[: -(len(suffix) + 1)]
                 break
-        return VLLMProvider(model_name=raw, tensor_parallel_size=tp)
+        return VLLMProvider(model_name=raw, tensor_parallel_size=tp, **kwargs)
 
     raise ValueError(
         f"Unknown provider backend '{backend}'. Supported: groq, hf, vllm"

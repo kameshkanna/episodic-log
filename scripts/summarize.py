@@ -382,7 +382,10 @@ def _run_vllm_sessions(
     from episodic_log.retrieval.summary_store import SummaryStore
     from episodic_log.summarizers import build_summarizer
 
-    provider = get_provider(provider_spec)
+    # Summarization prompts are short (~200 tokens each).  32768 batched tokens
+    # would leave the 7B model's small weight shard with almost no VRAM headroom
+    # for forward-pass activations on A100 40GB.  8192 is plenty for throughput.
+    provider = get_provider(provider_spec, max_num_batched_tokens=8192)
     summarizer = build_summarizer(method=method, provider=provider)
 
     # Phase 1: load all events from all pending sessions.
