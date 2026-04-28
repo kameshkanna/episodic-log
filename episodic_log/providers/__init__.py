@@ -64,7 +64,10 @@ def get_provider(spec: str, **kwargs) -> BaseProvider:
                 tp = n
                 raw = raw[: -(len(suffix) + 1)]
                 break
-        return VLLMProvider(model_name=raw, tensor_parallel_size=tp, **kwargs)
+        # Only pass kwargs that VLLMProvider accepts; HF-only kwargs (device_map, etc.) are silently dropped.
+        _VLLM_KWARGS = {"gpu_memory_utilization", "max_model_len", "max_num_batched_tokens"}
+        vllm_kwargs = {k: v for k, v in kwargs.items() if k in _VLLM_KWARGS}
+        return VLLMProvider(model_name=raw, tensor_parallel_size=tp, **vllm_kwargs)
 
     raise ValueError(
         f"Unknown provider backend '{backend}'. Supported: groq, hf, vllm"
